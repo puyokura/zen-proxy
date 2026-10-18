@@ -29,6 +29,17 @@ function normalizeUpstream(v) {
   return LEGACY_UPSTREAMS.has(u.toLowerCase()) ? DEFAULT_UPSTREAM : u
 }
 
+// Comma/whitespace separated list -> trimmed, non-empty strings. Credential
+// settings accept either a JSON array (config file) or a separated string
+// (environment variable), and both spellings have to land on the same value.
+function parseList(v) {
+  if (Array.isArray(v)) return v.map((x) => String(x).trim()).filter(Boolean)
+  return String(v ?? "")
+    .split(/[\s,]+/)
+    .map((s) => s.trim())
+    .filter(Boolean)
+}
+
 // ---- shipped model catalog -------------------------------------------------
 // models.json is the source of truth for which free models we offer. The
 // model-sync GitHub Action keeps it current from opencode's public /models
@@ -49,6 +60,7 @@ const BAKED_MODELS = [
   "cat-jam-free",
   "deepseek-v4.1-flash-free",
   "nemotron-3.5-super-vl-free",
+  "jev-1.13-free",
 ]
 function loadShippedModels() {
   try {
@@ -180,9 +192,10 @@ const DEFAULT_CONFIG = {
   uaRefreshMs: Number(ENV.UA_REFRESH_MS ?? 6 * 3600_000),
   injectSession: ENV.INJECT_SESSION !== "0",
   // Which credentials the auto-sync health probe uses:
-  //   "auto"      — use defaultZenKey when set, otherwise anonymous `public`
-  //   "key"       — always use defaultZenKey (probe fails if none is set)
-  //   "anonymous" — always anonymous `public`, even when a key is configured
+  //   "auto"      — a configured account when one exists (defaultZenKey,
+  //                 zenKeys, or the refs of zenKeysFile), otherwise `public`
+  //   "key"       — same as auto (kept for older configs)
+  //   "anonymous" — always anonymous `public`, even when keys are configured
   probeAuth: ENV.PROBE_AUTH ?? "auto",
   // "" = auto: at request time the first *healthy* free model becomes the default
   // (see effectiveDefault), so a model that disappears upstream never bricks new
@@ -212,6 +225,15 @@ const DEFAULT_CONFIG = {
   rateLimitWindowMs: Number(ENV.RATE_LIMIT_WINDOW_MS ?? 60_000),
   proxyKey: ENV.PROXY_KEY ?? "",
   defaultZenKey: ENV.ZEN_KEY ?? "",
+  // Extra Zen credentials, on top of defaultZenKey. Two free accounts on one
+  // endpoint is the point: the pool is spread over successive requests, so the
+  // per-account quota stops being the ceiling.
+  zenKeys: parseList(ENV.ZEN_KEYS ?? ""),
+  // Read credentials straight out of a dsh-style store
+  // (`~/.dsh/.credentials.yaml`). Only the scalar entries directly under
+  // `refs:` whose name is listed in zenKeysRefs are read.
+  zenKeysFile: String(ENV.ZEN_KEYS_FILE ?? "").trim(),
+  zenKeysRefs: parseList(ENV.ZEN_KEYS_REFS ?? ""),
   trustForwarded: ENV.TRUST_FORWARDED === "1",
   timeoutMs: Number(ENV.TIMEOUT_MS ?? 120000),
   cacheMs: Number(ENV.CACHE_MS ?? 30000),
@@ -335,15 +357,21 @@ function sanitize(cfg) {
   const out = { ...cfg }
   if (out.proxyKey) out.proxyKey = "••••••••"
   if (out.defaultZenKey) out.defaultZenKey = maskKey(out.defaultZenKey)
+  if (Array.isArray(out.zenKeys)) out.zenKeys = out.zenKeys.map((k) => (k ? maskKey(k) : k))
   return out
 }
 
 const ALLOWED = () => new Set([...config.fallbackModels, ...Object.values(config.modelAliases)])
-const MAX_BODY = 1024 * 1024
+const MAX_BODY = 8 * 1024 * 1024
 const requestStats = { total: 0, errors: 0, recent: [], perMinute: new Map(), window60: [] }
 // jev-* free models are served on /v1/systemone (structured classification),
-// not on a chat/responses endpoint, so they are never routable here.
-const NOT_CHAT_SERVABLE = [/^jev-/]
+// which has a different request and reply shape from chat/responses. They are
+// listed like every other free model, but a chat or Anthropic request naming one
+// is refused with a pointer at the systemone route, and never forwarded as chat.
+const SYSTEMONE_PATH = "/v1/systemone"
+const SYSTEMONE_UPSTREAM_SUFFIX = "/systemone/v1/systemone"
+const SYSTEMONE_ONLY = [/^jev-/]
+const isSystemoneOnly = (id) => SYSTEMONE_ONLY.some((re) => re.test(String(id ?? "")))
 
 // opencode's free tier requires every request to carry session identity: upstream
 // returns 400 `MissingSessionID` with no session header, and 403 `FreeTierError`
@@ -820,7 +848,7 @@ function num(v, dflt) {
   const n = Number(v)
   return Number.isFinite(n) ? n : dflt
 }
-const syncState = { at: 0, ok: false, running: false, working: [], rateLimited: [], flaky: [], gated: [], dead: [], error: "", ms: 0 }
+const syncState = { at: 0, ok: false, running: false, working: [], rateLimited: [], flaky: [], gated: [], dead: [], systemone: [], error: "", ms: 0 }
 // Health learned from real client traffic. The free tier rejects our synthetic
 // health probe (it only accepts genuine agent-shaped requests), so real traffic
 // is the only trustworthy signal that a model is actually serving.
@@ -872,15 +900,16 @@ function recordReq(req, model, ms, status, at = Date.now()) {
 function effectiveDefault() {
   if (config.defaultModel) return config.defaultModel
   const synced = new Set([...(syncState.working ?? []), ...(syncState.rateLimited ?? [])])
-  for (const m of config.fallbackModels) if (synced.has(m)) return m
-  return config.fallbackModels[0] ?? ""
+  for (const m of config.fallbackModels) if (synced.has(m) && !isSystemoneOnly(m)) return m
+  // A classifier is never the default chat model, whatever the list order says.
+  return config.fallbackModels.find((m) => !isSystemoneOnly(m)) ?? config.fallbackModels[0] ?? ""
 }
 
 function resolveModel(requested) {
   const dflt = effectiveDefault()
   const id = String(requested ?? "").split("/").pop()
   const target = config.modelAliases[id] || (ALLOWED().has(id) ? id : "") || dflt
-  const rest = config.fallbackModels.filter((m) => m !== target)
+  const rest = config.fallbackModels.filter((m) => m !== target && !isSystemoneOnly(m))
   return { requested: id || dflt, candidates: [target, ...rest] }
 }
 
@@ -931,18 +960,157 @@ function bearer(req) {
   return typeof v === "string" && v.startsWith("Bearer ") ? v.slice(7).trim() : ""
 }
 
-function authForUpstream(req) {
-  const incoming = bearer(req)
-  if (config.proxyKey) {
-    if (incoming !== config.proxyKey) return null
-    const zen = req.headers["x-zen-key"]
-    if (typeof zen === "string" && zen && zen !== "public") return `Bearer ${zen}`
-    if (config.defaultZenKey) return `Bearer ${config.defaultZenKey}`
-    return "Bearer public"
+// ---- upstream credential pool ---------------------------------------------
+// A Zen free quota is per account, so one key is the ceiling. The pool holds
+// every credential the install was given — `defaultZenKey`, then `zenKeys`, then
+// the `refs:` entries named in `zenKeysRefs` of `zenKeysFile` — deduplicated in
+// that order. Successive requests start on the next key, and a key that answers
+// 401/429 is swapped for the following one before the request is retried on the
+// same model, so a saturated account degrades into the other account rather
+// than into an error.
+const credsCache = new Map()
+const keyStats = new Map()
+let keyCursor = 0
+
+// Narrow reader for a dsh-style store (`~/.dsh/.credentials.yaml`): only scalar
+// entries directly under the top-level `refs:` map, and only the names listed in
+// zenKeysRefs. Nothing else is parsed, and no value is ever logged.
+function readRefsKeys(text, names) {
+  const want = new Set(names)
+  const out = []
+  let inRefs = false
+  let refsIndent = -1
+  for (const line of String(text).split(/\r?\n/)) {
+    const m = /^(\s*)([A-Za-z0-9_.-]+):\s*(.*)$/.exec(line.replace(/\s+$/, ""))
+    if (!m) continue
+    const indent = m[1].length
+    const name = m[2]
+    const value = m[3].trim()
+    if (!inRefs) {
+      if (name === "refs" && value === "") {
+        inRefs = true
+        refsIndent = indent
+      }
+      continue
+    }
+    if (indent <= refsIndent) {
+      inRefs = false
+      continue
+    }
+    if (!want.has(name) || !value) continue
+    out.push(value.replace(/^["']|["']$/g, ""))
   }
-  if (incoming && incoming !== "public") return `Bearer ${incoming}`
-  if (config.defaultZenKey) return `Bearer ${config.defaultZenKey}`
-  return "Bearer public"
+  return out
+}
+
+function credentialsKeys() {
+  const file = String(config.zenKeysFile ?? "").trim()
+  const refs = Array.isArray(config.zenKeysRefs) ? config.zenKeysRefs : []
+  if (!file || !refs.length) return []
+  try {
+    const st = fs.statSync(file)
+    const hit = credsCache.get(file)
+    if (hit && hit.mtimeMs === st.mtimeMs && hit.size === st.size) return hit.keys
+    const keys = readRefsKeys(fs.readFileSync(file, "utf8"), refs)
+    credsCache.set(file, { mtimeMs: st.mtimeMs, size: st.size, keys })
+    return keys
+  } catch {
+    return []
+  }
+}
+
+function poolKeys() {
+  const listed = [config.defaultZenKey, ...(Array.isArray(config.zenKeys) ? config.zenKeys : []), ...credentialsKeys()]
+  const seen = new Set()
+  const out = []
+  for (const raw of listed) {
+    const key = String(raw ?? "").trim()
+    if (!key || key === "public" || seen.has(key)) continue
+    seen.add(key)
+    out.push(key)
+  }
+  return out
+}
+
+function keyLabel(auth) {
+  const key = String(auth ?? "").replace(/^Bearer\s+/, "")
+  return key ? maskKey(key) : "public"
+}
+
+function noteKeyUsed(auth, status) {
+  const label = keyLabel(auth)
+  const rec = keyStats.get(label) ?? { requests: 0, ok: 0, rateLimited: 0, authFailed: 0, gated: 0, errors: 0 }
+  rec.requests++
+  if (status === 200) rec.ok++
+  else if (status === 429) rec.rateLimited++
+  // 401 is the credential being refused. 403 is the free-tier agent gate, which
+  // every client hits on a synthetic or bare request regardless of the key, so
+  // it is counted apart instead of being reported as a bad credential.
+  else if (status === 401) rec.authFailed++
+  else if (status === 403) rec.gated++
+  else if (status >= 400) rec.errors++
+  keyStats.set(label, rec)
+}
+
+// A rejected credential deserves the next account; a rejected request does not.
+function keyRotationWorthy(status, body) {
+  if (status === 401 || status === 429) return true
+  const msg = String(body?.error?.message ?? body?.message ?? "")
+  return /rate.?limit|usage limit|quota|invalid api key|missing api key|unauthor/i.test(msg)
+}
+
+// Key order for one request: the next pool key first (round-robin), then the
+// rest. A key the client sent is honoured as sent; `includePoolFallback` lets
+// the configured pool rescue a placeholder token, which is what Anthropic
+// clients (Claude Code) send.
+function upstreamAuths(req, includePoolFallback = false) {
+  const incoming = bearer(req)
+  if (config.proxyKey && incoming !== config.proxyKey) return { invalid: true, auths: [], supplied: false }
+  const header = req?.headers?.["x-zen-key"]
+  const client =
+    typeof header === "string" && header.trim() && header.trim() !== "public"
+      ? header.trim()
+      : !config.proxyKey && incoming && incoming !== "public"
+        ? incoming
+        : ""
+  if (client) {
+    const auths = [`Bearer ${client}`]
+    if (includePoolFallback) auths.push(...rotatedPool())
+    return { invalid: false, auths, supplied: true }
+  }
+  const pool = rotatedPool()
+  // The anonymous tier is the last resort behind the accounts: a key that has
+  // expired, been revoked, or is simply not a Zen credential must not take the
+  // whole endpoint down with it, and per-key usage plus the rotation log make
+  // the failure visible either way.
+  return { invalid: false, auths: pool.length ? [...pool, "Bearer public"] : ["Bearer public"], supplied: false }
+}
+
+function rotatedPool() {
+  const pool = poolKeys()
+  if (!pool.length) return []
+  if (pool.length === 1) return [`Bearer ${pool[0]}`]
+  const start = keyCursor++ % pool.length
+  return [...pool.slice(start), ...pool.slice(0, start)].map((k) => `Bearer ${k}`)
+}
+
+function keyPoolStatus() {
+  const pool = poolKeys()
+  return {
+    accounts: pool.length,
+    rotation: pool.length > 1 ? "round-robin" : "single",
+    configured: {
+      defaultZenKey: !!config.defaultZenKey,
+      zenKeys: Array.isArray(config.zenKeys) ? config.zenKeys.length : 0,
+      refs: Array.isArray(config.zenKeysRefs) ? config.zenKeysRefs.length : 0,
+    },
+    file: config.zenKeysFile ? { path: config.zenKeysFile, resolved: credentialsKeys().length } : null,
+    usage: Object.fromEntries([...keyStats.entries()].map(([label, rec]) => [label, { ...rec }])),
+  }
+}
+
+function authForUpstream(req) {
+  return upstreamAuths(req).auths[0] ?? null
 }
 
 async function readBody(req, limit = MAX_BODY) {
@@ -998,27 +1166,36 @@ async function handleMessages(req, res) {
   }
 
   const { requested, candidates } = resolveModel(body.model)
+  if (isSystemoneOnly(requested)) {
+    recordReq(req, requested, Date.now() - start, 400)
+    const e = anthropicError(400, {
+      error: {
+        type: "invalid_request_error",
+        message: `${requested} is served on ${SYSTEMONE_PATH} (structured classification), not on /v1/messages`,
+      },
+    })
+    return json(res, e.status, e.body)
+  }
   const isStream = !!body.stream
   // Route the credential the client sent. x-api-key is Anthropic's convention
   // and may legitimately be a real Zen key, so prefer it over the bearer token.
-  const apiKey = bearerOrKey(req)
-  let auth = authForUpstream(req)
-  if (typeof req.headers["x-api-key"] === "string" && req.headers["x-api-key"].trim()) {
-    auth = `Bearer ${req.headers["x-api-key"].trim()}`
-  } else if (apiKey && apiKey !== "public" && !config.proxyKey && !config.defaultZenKey) {
-    auth = `Bearer ${apiKey}`
-  }
-  if (!auth) {
+  const headerKey = typeof req.headers["x-api-key"] === "string" ? req.headers["x-api-key"].trim() : ""
+  const plan = upstreamAuths(req, true)
+  if (plan.invalid) {
     recordReq(req, requested, Date.now() - start, 401)
     const e = anthropicError(401, { error: { type: "authentication_error", message: "invalid proxy key" } })
     return json(res, e.status, e.body)
   }
   // An Anthropic client always sends some token (Claude Code uses whatever
   // ANTHROPIC_AUTH_TOKEN holds, which for a local proxy is usually a placeholder).
-  // If upstream rejects it, fall back to the configured key or the anonymous tier
-  // rather than failing the request outright.
-  const fallbackAuth = config.proxyKey ? null : config.defaultZenKey ? `Bearer ${config.defaultZenKey}` : "Bearer public"
-  let triedFallback = false
+  // That token is tried first, then the configured accounts, then the anonymous
+  // tier — a placeholder never fails the request outright.
+  const auths = [...plan.auths]
+  if (headerKey && headerKey !== "public") {
+    const first = `Bearer ${headerKey}`
+    if (!auths.includes(first)) auths.unshift(first)
+  }
+  if (!auths.includes("Bearer public")) auths.push("Bearer public")
 
   let lastErr = null
   let lastStatus = 502
@@ -1027,61 +1204,66 @@ async function handleMessages(req, res) {
     used = model
     const format = modelFormat(model)
     const payload = format === "responses" ? responsesRequest(anthropicToChatBody(body, model), model, isStream) : anthropicToChatBody(body, model)
-    let upstreamRes
-    try {
-      upstreamRes = await fetch(`${config.upstream}${format === "responses" ? "/responses" : "/chat/completions"}`, {
-        method: "POST",
-        headers: zenHeaders(req, auth),
-        body: JSON.stringify(payload),
-        signal: isStream ? req.signal : AbortSignal.timeout(config.timeoutMs),
-      })
-    } catch (err) {
-      lastErr = { error: { type: "api_error", message: err.message } }
-      lastStatus = 502
-      continue
-    }
+    let nextModel = false
+    for (let ai = 0; ai < auths.length; ai++) {
+      const auth = auths[ai]
+      let upstreamRes
+      try {
+        upstreamRes = await fetch(`${config.upstream}${format === "responses" ? "/responses" : "/chat/completions"}`, {
+          method: "POST",
+          headers: zenHeaders(req, auth),
+          body: JSON.stringify(payload),
+          signal: isStream ? req.signal : AbortSignal.timeout(config.timeoutMs),
+        })
+      } catch (err) {
+        lastErr = { error: { type: "api_error", message: err.message } }
+        lastStatus = 502
+        nextModel = true
+        break
+      }
+      noteKeyUsed(auth, upstreamRes.status)
 
-    if (upstreamRes.status === 401 && !triedFallback && fallbackAuth && fallbackAuth !== auth) {
-      triedFallback = true
-      auth = fallbackAuth
-      continue
-    }
-
-    if (upstreamRes.ok) {
-      if (isStream) {
-        const chunks = format === "responses" ? responsesChunksAsChat(upstreamRes) : sseChunks(upstreamRes)
-        relayAnthropicStream(req, res, chunks, requested, model)
-        res.on("finish", () => {
+      if (upstreamRes.ok) {
+        if (isStream) {
+          const chunks = format === "responses" ? responsesChunksAsChat(upstreamRes) : sseChunks(upstreamRes)
+          relayAnthropicStream(req, res, chunks, requested, model)
+          res.on("finish", () => {
+            recordReq(req, `${requested}→${model}`, Date.now() - start, 200)
+            recordObserved(model, true)
+          })
+          return
+        }
+        try {
+          const content = await upstreamRes.json()
+          const shaped = format === "responses" ? responsesToChat(content, requested, model) : content
           recordReq(req, `${requested}→${model}`, Date.now() - start, 200)
           recordObserved(model, true)
-        })
-        return
+          return json(res, 200, chatToAnthropic(shaped, requested, model))
+        } catch {
+          recordReq(req, requested, Date.now() - start, 502)
+          return json(res, 502, anthropicError(502, { error: { type: "api_error", message: "bad upstream response" } }).body)
+        }
       }
-      try {
-        const content = await upstreamRes.json()
-        const shaped = format === "responses" ? responsesToChat(content, requested, model) : content
-        recordReq(req, `${requested}→${model}`, Date.now() - start, 200)
-        recordObserved(model, true)
-        return json(res, 200, chatToAnthropic(shaped, requested, model))
-      } catch {
-        recordReq(req, requested, Date.now() - start, 502)
-        return json(res, 502, anthropicError(502, { error: { type: "api_error", message: "bad upstream response" } }).body)
-      }
-    }
 
-    try {
-      lastErr = await upstreamRes.json()
-    } catch {
-      lastErr = { error: { type: "api_error", message: `upstream returned ${upstreamRes.status}` } }
-    }
-    lastStatus = upstreamRes.status
-    if (retryableUpstream(upstreamRes.status, lastErr)) {
+      try {
+        lastErr = await upstreamRes.json()
+      } catch {
+        lastErr = { error: { type: "api_error", message: `upstream returned ${upstreamRes.status}` } }
+      }
+      lastStatus = upstreamRes.status
+      if (keyRotationWorthy(upstreamRes.status, lastErr) && ai + 1 < auths.length) {
+        log(`${keyLabel(auth)} rejected (${upstreamRes.status}) — retrying ${model} on the next account`)
+        continue
+      }
       recordObserved(model, false)
-      const wait = Math.min(parseRetryAfter(upstreamRes.headers.get("retry-after")) * 1000, 3000)
-      if (wait > 0) await new Promise((r) => setTimeout(r, wait))
-      continue
+      nextModel = retryableUpstream(upstreamRes.status, lastErr)
+      if (nextModel) {
+        const wait = Math.min(parseRetryAfter(upstreamRes.headers.get("retry-after")) * 1000, 3000)
+        if (wait > 0) await new Promise((r) => setTimeout(r, wait))
+      }
+      break
     }
-    recordObserved(model, false)
+    if (nextModel) continue
     break
   }
 
@@ -1108,12 +1290,22 @@ async function handleChat(req, res) {
   }
 
   const { requested, candidates } = resolveModel(body.model)
+  if (isSystemoneOnly(requested)) {
+    recordReq(req, requested, Date.now() - start, 400)
+    return json(res, 400, {
+      error: {
+        type: "invalid_request_error",
+        message: `${requested} is served on ${SYSTEMONE_PATH} (structured classification), not on /v1/chat/completions`,
+      },
+    })
+  }
   const isStream = !!body.stream
-  const auth = authForUpstream(req)
-  if (!auth) {
+  const plan = upstreamAuths(req)
+  if (plan.invalid) {
     recordReq(req, requested, Date.now() - start, 401)
     return json(res, 401, { error: { type: "invalid_request_error", message: "invalid proxy key" } })
   }
+  const auths = plan.auths.length ? plan.auths : ["Bearer public"]
 
   let lastErr = null
   let lastStatus = 502
@@ -1132,73 +1324,86 @@ async function handleChat(req, res) {
       if (format === "responses") delete payload.tool_choice
       else payload.tool_choice = "none"
     }
-    let upstreamRes
-    try {
-      upstreamRes = await fetch(`${config.upstream}${format === "responses" ? "/responses" : "/chat/completions"}`, {
-        method: "POST",
-        headers: zenHeaders(req, auth),
-        body: JSON.stringify(payload),
-        signal: isStream ? req.signal : AbortSignal.timeout(config.timeoutMs),
-      })
-    } catch (err) {
-      lastErr = { error: { type: "upstream_error", message: err.message } }
-      lastStatus = 502
-      continue
-    }
-
-    if (upstreamRes.ok) {
-      if (isStream) {
-        if (format === "responses") {
-          relayResponsesStream(req, res, upstreamRes, requested, bridged)
-        } else {
-          relayStream(req, res, upstreamRes, requested, bridged)
-        }
-        res.on("finish", () => { recordReq(req, `${requested}→${model}`, Date.now() - start, 200); recordObserved(model, true) })
-        return
-      }
+    let nextModel = false
+    for (let ai = 0; ai < auths.length; ai++) {
+      const auth = auths[ai]
+      let upstreamRes
       try {
-        const content = await upstreamRes.json()
-        if (format === "responses") {
+        upstreamRes = await fetch(`${config.upstream}${format === "responses" ? "/responses" : "/chat/completions"}`, {
+          method: "POST",
+          headers: zenHeaders(req, auth),
+          body: JSON.stringify(payload),
+          signal: isStream ? req.signal : AbortSignal.timeout(config.timeoutMs),
+        })
+      } catch (err) {
+        lastErr = { error: { type: "upstream_error", message: err.message } }
+        lastStatus = 502
+        nextModel = true
+        break
+      }
+      noteKeyUsed(auth, upstreamRes.status)
+
+      if (upstreamRes.ok) {
+        if (isStream) {
+          if (format === "responses") {
+            relayResponsesStream(req, res, upstreamRes, requested, bridged)
+          } else {
+            relayStream(req, res, upstreamRes, requested, bridged)
+          }
+          res.on("finish", () => { recordReq(req, `${requested}→${model}`, Date.now() - start, 200); recordObserved(model, true) })
+          return
+        }
+        try {
+          const content = await upstreamRes.json()
+          if (format === "responses") {
+            recordReq(req, `${requested}→${model}`, Date.now() - start, 200)
+            recordObserved(model, true)
+            return json(res, 200, stripToolCalls(responsesToChat(content, requested, model), bridged))
+          }
+          if (model !== requested) {
+            // Make the fallback visible to any client, not just JSON readers.
+            res.setHeader?.("x-zen-served-by", model)
+            res.setHeader?.("x-zen-fallback", "true")
+          }
+          if (content && typeof content === "object") {
+            content.model = requested
+            if (model !== requested) content.zen_served_by = model
+            stripToolCalls(content, bridged)
+          }
           recordReq(req, `${requested}→${model}`, Date.now() - start, 200)
           recordObserved(model, true)
-          return json(res, 200, stripToolCalls(responsesToChat(content, requested, model), bridged))
+          return json(res, 200, content)
+        } catch {
+          recordReq(req, requested, Date.now() - start, 502)
+          return json(res, 502, { error: { type: "upstream_error", message: "bad upstream response" } })
         }
-        if (model !== requested) {
-          // Make the fallback visible to any client, not just JSON readers.
-          res.setHeader?.("x-zen-served-by", model)
-          res.setHeader?.("x-zen-fallback", "true")
-        }
-        if (content && typeof content === "object") {
-          content.model = requested
-          if (model !== requested) content.zen_served_by = model
-          stripToolCalls(content, bridged)
-        }
-        recordReq(req, `${requested}→${model}`, Date.now() - start, 200)
-        recordObserved(model, true)
-        return json(res, 200, content)
-      } catch {
-        recordReq(req, requested, Date.now() - start, 502)
-        return json(res, 502, { error: { type: "upstream_error", message: "bad upstream response" } })
       }
-    }
 
-    try {
-      lastErr = await upstreamRes.json()
-    } catch {
-      lastErr = { error: { type: "upstream_error", message: `upstream returned ${upstreamRes.status}` } }
-    }
-    lastStatus = upstreamRes.status
-    // Try the next candidate not only on 429/5xx but also when the upstream
-    // reports a model/environment-level failure (e.g. a provider that is
-    // temporarily "unavailable", a geo-blocked free model, or a stale model id)
-    // so one dead model doesn't brick the whole request.
-    if (retryableUpstream(upstreamRes.status, lastErr)) {
+      try {
+        lastErr = await upstreamRes.json()
+      } catch {
+        lastErr = { error: { type: "upstream_error", message: `upstream returned ${upstreamRes.status}` } }
+      }
+      lastStatus = upstreamRes.status
+      // A rejected account is swapped before the model is abandoned: the model
+      // is fine, this credential is not.
+      if (keyRotationWorthy(upstreamRes.status, lastErr) && ai + 1 < auths.length) {
+        log(`${keyLabel(auth)} rejected (${upstreamRes.status}) — retrying ${model} on the next account`)
+        continue
+      }
+      // Try the next candidate not only on 429/5xx but also when the upstream
+      // reports a model/environment-level failure (e.g. a provider that is
+      // temporarily "unavailable", a geo-blocked free model, or a stale model id)
+      // so one dead model doesn't brick the whole request.
       recordObserved(model, false)
-      const wait = Math.min(parseRetryAfter(upstreamRes.headers.get("retry-after")) * 1000, 3000)
-      if (wait > 0) await new Promise((r) => setTimeout(r, wait))
-      continue
+      nextModel = retryableUpstream(upstreamRes.status, lastErr)
+      if (nextModel) {
+        const wait = Math.min(parseRetryAfter(upstreamRes.headers.get("retry-after")) * 1000, 3000)
+        if (wait > 0) await new Promise((r) => setTimeout(r, wait))
+      }
+      break
     }
-    recordObserved(model, false)
+    if (nextModel) continue
     break
   }
 
@@ -1497,8 +1702,11 @@ function responsesRequest(body, model, isStream) {
 function probeAuthHeader() {
   const mode = String(config.probeAuth ?? "auto").toLowerCase()
   if (mode === "anonymous") return "Bearer public"
-  if (config.defaultZenKey) return `Bearer ${config.defaultZenKey}`
-  if (mode === "key") return "Bearer public" // no key configured; anonymous is all we can do
+  // "auto" and "key" both prefer a configured account, wherever it came from
+  // (defaultZenKey, zenKeys, or the refs of zenKeysFile). The anonymous tier is
+  // the last resort, and the free tier gates synthetic probes anyway.
+  const pool = rotatedPool()
+  if (pool.length) return pool[0]
   return "Bearer public"
 }
 
@@ -1680,7 +1888,9 @@ async function syncModels() {
     if (!res.ok) throw new Error(`upstream /models → ${res.status}`)
     const parsed = await res.json()
     const upstreamIds = new Set((parsed.data ?? []).map((m) => m.id))
-    const isFree = (id) => VALID_MODEL_ID.test(id) && !NOT_CHAT_SERVABLE.some((re) => re.test(id))
+    // Everything listable is offered: chat models, and the systemone-served ones
+    // (jev-*), whose liveness is probed on their own endpoint below.
+    const isFree = (id) => VALID_MODEL_ID.test(id)
     const current = [...config.fallbackModels].filter(isFree)
     // Everything the upstream currently offers for free. The user's list is
     // merged with this, so a model that exists but is temporarily blocked still
@@ -1692,6 +1902,7 @@ async function syncModels() {
     const dead = []
     const flaky = []
     const gated = []
+    const systemone = []
     // Only definitively-gone models are dropped from the user's list; `flaky`
     // ones stay configured so they recover on their own.
     const removeFromCurrent = new Set()
@@ -1700,6 +1911,14 @@ async function syncModels() {
     const probe = async () => {
       while (idx < candidates.length) {
         const id = candidates[idx++]
+        // A systemone model is a classifier, not a chat model: the catalog is the
+        // only authority on whether upstream still offers it, and a synthetic
+        // probe of it would prove nothing (the free tier gates probes). Keep it
+        // and never probe it.
+        if (isSystemoneOnly(id)) {
+          systemone.push(id)
+          continue
+        }
         try {
           const r = await probeModel(id, auth, sessionHeader())
           let bodyErr = ""
@@ -1773,15 +1992,16 @@ async function syncModels() {
       if (fallbackModelsPinned) {
         try { saveConfig({ fallbackModels: newList }) } catch {}
       }
-      log(`auto-sync: updated model list (${working.length} ok, ${rateLimited.length} rate-limited, ${gated.length} agent-only, ${flaky.length} flaky, ${dead.length} dead${fallbackModelsPinned ? "" : ", not pinned"})`)
+      log(`auto-sync: updated model list (${working.length} ok, ${rateLimited.length} rate-limited, ${gated.length} agent-only, ${systemone.length} systemone, ${flaky.length} flaky, ${dead.length} dead${fallbackModelsPinned ? "" : ", not pinned"})`)
     } else {
-      log(`auto-sync: list unchanged (${working.length} ok, ${rateLimited.length} rate-limited, ${gated.length} agent-only, ${flaky.length} flaky, ${dead.length} dead)`)
+      log(`auto-sync: list unchanged (${working.length} ok, ${rateLimited.length} rate-limited, ${gated.length} agent-only, ${systemone.length} systemone, ${flaky.length} flaky, ${dead.length} dead)`)
     }
     syncState.working = working
     syncState.rateLimited = rateLimited
     syncState.flaky = flaky
     syncState.gated = gated
     syncState.dead = dead
+    syncState.systemone = systemone
     syncState.error = ""
     syncState.ok = true
     modelsCache = { at: 0, data: [], ok: true }
@@ -1934,6 +2154,15 @@ async function handleApiConfig(req, res) {
       if (cleaned.defaultZenKey === sanitize({ defaultZenKey: config.defaultZenKey }).defaultZenKey) {
         cleaned.defaultZenKey = config.defaultZenKey
       }
+      if (Array.isArray(cleaned.zenKeys)) {
+        // A masked array is what a settings form reads back: keep the stored keys.
+        if (cleaned.zenKeys.some((k) => typeof k === "string" && k.includes("•"))) cleaned.zenKeys = config.zenKeys
+        else cleaned.zenKeys = cleaned.zenKeys.map((k) => String(k).trim()).filter(Boolean)
+      } else {
+        cleaned.zenKeys = config.zenKeys
+      }
+      cleaned.zenKeysRefs = Array.isArray(cleaned.zenKeysRefs) ? cleaned.zenKeysRefs.map(String) : config.zenKeysRefs
+      if (typeof cleaned.zenKeysFile !== "string") cleaned.zenKeysFile = config.zenKeysFile
       if (!Array.isArray(cleaned.fallbackModels)) cleaned.fallbackModels = config.fallbackModels
       // Saving from the dashboard is an explicit edit of the list, so from here on
       // this install owns it rather than tracking models.json.
@@ -1968,7 +2197,19 @@ async function handleStatus(req, res) {
   for (const [m, c] of requestStats.perMinute) {
     if (minute - m <= 5) last5m += c
   }
-  const authMode = config.defaultZenKey ? (config.proxyKey ? "proxy+byok" : "byok") : config.proxyKey ? "proxy" : "public"
+  const pool = keyPoolStatus()
+  const authMode =
+    pool.accounts > 1
+      ? config.proxyKey
+        ? "proxy+pool"
+        : "pool"
+      : config.defaultZenKey
+        ? config.proxyKey
+          ? "proxy+byok"
+          : "byok"
+        : config.proxyKey
+          ? "proxy"
+          : "public"
   json(res, 200, {
     uptime: Math.floor(process.uptime()),
     upstreamOk: cache.ok,
@@ -1977,7 +2218,8 @@ async function handleStatus(req, res) {
     uaAutoVersion: uaAutoState.version,
     defaultModel: config.defaultModel,
     effectiveDefault: effectiveDefault(),
-    auth: { mode: authMode, zenKey: maskKey(config.defaultZenKey), proxyKey: !!config.proxyKey },
+    auth: { mode: authMode, zenKey: maskKey(config.defaultZenKey), proxyKey: !!config.proxyKey, accounts: pool.accounts },
+    keys: pool,
     responsesModels: [...(config.responsesModels ?? [])],
     rateLimit: { max: config.rateLimitMax, windowMs: config.rateLimitWindowMs },
     probeAuth: config.probeAuth ?? "auto",
@@ -1997,6 +2239,8 @@ async function handleStatus(req, res) {
       working: [...syncState.working],
       rateLimited: [...syncState.rateLimited],
       gated: [...syncState.gated],
+      // Classifiers (jev-*): catalogued, served on /v1/systemone, never probed.
+      systemone: [...syncState.systemone],
       flaky: [...syncState.flaky],
       dead: [...syncState.dead],
       // Health learned from real client requests — the only reliable signal for
@@ -2026,8 +2270,9 @@ async function handleTest(req, res) {
       typeof body.zenKey === "string" && body.zenKey.trim()
         ? `Bearer ${body.zenKey.trim()}`
         : (authForUpstream(req) ?? "Bearer public")
-    const format = modelFormat(model)
-    const upstreamRes = await fetch(`${config.upstream}${format === "responses" ? "/responses" : "/chat/completions"}`, {
+    const systemone = isSystemoneOnly(model)
+    const format = systemone ? "systemone" : modelFormat(model)
+    const upstreamRes = await fetch(systemone ? systemoneURL() : `${config.upstream}${format === "responses" ? "/responses" : "/chat/completions"}`, {
       method: "POST",
       headers: (() => {
         const h = {
@@ -2043,17 +2288,21 @@ async function handleTest(req, res) {
         return h
       })(),
       body: JSON.stringify(
-        format === "responses"
-          ? { model, input: "ping", max_output_tokens: 32 }
-          : { model, messages: [{ role: "user", content: "ping" }], max_tokens: 5 },
+        systemone
+          ? { model, state: "ping", questions: { ping: { type: "noul", instructions: "Is this request a liveness check?" } } }
+          : format === "responses"
+            ? { model, input: "ping", max_output_tokens: 32 }
+            : { model, messages: [{ role: "user", content: "ping" }], max_tokens: 5 },
       ),
       signal: AbortSignal.timeout(config.timeoutMs),
     })
+    noteKeyUsed(auth, upstreamRes.status)
     let detail = ""
     let gated = false
     try {
       const parsed = await upstreamRes.json()
-      if (format === "responses") detail = parsed.error?.message ?? (typeof parsed.output_text === "string" ? parsed.output_text : "")
+      if (systemone) detail = parsed.error?.message ?? JSON.stringify(parsed).slice(0, 300)
+      else if (format === "responses") detail = parsed.error?.message ?? (typeof parsed.output_text === "string" ? parsed.output_text : "")
       else detail = parsed.error?.message ?? parsed.choices?.[0]?.message?.content ?? ""
       // A free-tier gate here is not a failure of the model: the free tier only
       // accepts genuine agent traffic, which a bare ping never is.
@@ -2097,6 +2346,79 @@ async function handleCountTokens(req, res) {
   // ~4 characters per token is the usual rule of thumb for English + code.
   const input_tokens = Math.max(1, Math.ceil(text.length / 4))
   return json(res, 200, { input_tokens })
+}
+
+// ---- System One (jev) ------------------------------------------------------
+// jev-1.13-free is a classifier, not a chat model: it takes a `state` and typed
+// `questions`, and answers with values and probabilities. The shape is its own,
+// so this route is a faithful pass-through — the body is forwarded byte for byte
+// and the reply is relayed unchanged. Nothing here invents a question schema.
+function systemoneURL() {
+  const base = String(config.upstream ?? "").replace(/\/+$/, "")
+  const root = base.endsWith("/v1") ? base.slice(0, -"/v1".length) : base
+  return root + SYSTEMONE_UPSTREAM_SUFFIX
+}
+
+async function handleSystemone(req, res) {
+  const start = Date.now()
+  let raw
+  let body
+  try {
+    raw = await readBody(req)
+    body = JSON.parse(raw)
+    if (!body || typeof body !== "object" || Array.isArray(body)) throw new Error("body must be a JSON object")
+  } catch (err) {
+    const status = err?.statusCode === 413 ? 413 : 400
+    return json(res, status, { error: { type: "invalid_request_error", message: err?.message ?? "invalid JSON body" } })
+  }
+
+  const model = String(body.model ?? "")
+  const plan = upstreamAuths(req)
+  if (plan.invalid) {
+    recordReq(req, model || "systemone", Date.now() - start, 401)
+    return json(res, 401, { error: { type: "authentication_error", message: "invalid proxy key" } })
+  }
+  const auths = plan.auths.length ? plan.auths : ["Bearer public"]
+
+  let lastErr = null
+  let lastStatus = 502
+  for (let ai = 0; ai < auths.length; ai++) {
+    const auth = auths[ai]
+    let upstreamRes
+    try {
+      upstreamRes = await fetch(systemoneURL(), {
+        method: "POST",
+        headers: zenHeaders(req, auth),
+        body: raw,
+        signal: AbortSignal.timeout(config.timeoutMs),
+      })
+    } catch (err) {
+      lastErr = { error: { type: "upstream_error", message: err.message } }
+      lastStatus = 502
+      continue
+    }
+    noteKeyUsed(auth, upstreamRes.status)
+    const text = await upstreamRes.text()
+    if (upstreamRes.ok) {
+      recordReq(req, `${model || "systemone"} (systemone)`, Date.now() - start, upstreamRes.status)
+      res.writeHead(200, { "content-type": upstreamRes.headers.get("content-type") ?? "application/json" })
+      return res.end(text)
+    }
+    try {
+      lastErr = JSON.parse(text)
+    } catch {
+      lastErr = { error: { type: "upstream_error", message: `upstream returned ${upstreamRes.status}` } }
+    }
+    lastStatus = upstreamRes.status
+    if (keyRotationWorthy(upstreamRes.status, lastErr) && ai + 1 < auths.length) {
+      log(`${keyLabel(auth)} rejected (${upstreamRes.status}) — retrying systemone on the next account`)
+      continue
+    }
+    break
+  }
+  recordReq(req, `${model || "systemone"} (systemone)`, Date.now() - start, lastStatus)
+  res.writeHead(lastStatus, { "content-type": "application/json" })
+  res.end(JSON.stringify(lastErr ?? { error: { type: "api_error", message: "systemone upstream unavailable" } }))
 }
 
 async function router(req, res) {
@@ -2154,7 +2476,8 @@ async function router(req, res) {
   if (req.method === "GET" && (p === "/v1/models" || p === "/models")) return handleModels(req, res)
   const isInference = p === "/v1/chat/completions" || p === "/chat/completions" || p === "/v1/responses" || p === "/responses"
   const isMessages = p === "/v1/messages" || p === "/messages"
-  if (req.method === "POST" && (isInference || isMessages)) {
+  const isSystemone = p === SYSTEMONE_PATH || p === "/systemone"
+  if (req.method === "POST" && (isInference || isMessages || isSystemone)) {
     // Throttle only the inference endpoints — the dashboard, /health and the
     // admin API must never be locked out by a client's burst.
     const rl = rateLimitFor(req)
@@ -2168,6 +2491,7 @@ async function router(req, res) {
         ),
       )
     }
+    if (isSystemone) return handleSystemone(req, res)
     return isMessages ? handleMessages(req, res) : handleChat(req, res)
   }
   if (req.method === "POST" && (p === "/v1/messages/count_tokens" || p === "/messages/count_tokens")) {
@@ -2239,6 +2563,16 @@ export {
   rateLimitFor,
   probeAuthHeader,
   authForUpstream,
+  upstreamAuths,
+  poolKeys,
+  keyPoolStatus,
+  readRefsKeys,
+  noteKeyUsed,
+  keyRotationWorthy,
+  isSystemoneOnly,
+  systemoneURL,
+  handleSystemone,
+  parseList,
   clientIp,
   ipOmit,
   zenHeaders,

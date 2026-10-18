@@ -179,15 +179,18 @@ Config lives in **`zen-proxy.json`** (auto-created on first run, hot-reloaded wh
 | `modelAliases` | `{}` | e.g. `{"gpt-4o":"mimo-v2.5-free"}` — reply model rewritten back |
 | `proxyKey` | `""` | If set, clients must send it as `Bearer`; locks the dashboard too |
 | `defaultZenKey` | `""` | Your own Zen key (BYOK) instead of anonymous `public` |
+| `zenKeys` | `[]` | Extra Zen keys; with two or more, accounts are rotated per request |
+| `zenKeysFile` | `""` | Credentials file to read keys from (e.g. `~/.dsh/.credentials.yaml`) |
+| `zenKeysRefs` | `[]` | Names of the `refs:` entries to take from `zenKeysFile`, in order |
 | `trustForwarded` | `false` | Trust `x-forwarded-for`/`x-real-ip` from a reverse proxy |
 | `timeoutMs` | `120000` | Upstream timeout for non-streaming |
 | `cacheMs` | `30000` | `/v1/models` cache TTL |
 
-Env vars: `HOST`, `PORT`, `ZEN_URL`, `ZEN_UA`, `INJECT_SESSION` (`0` to disable), `AUTO_UA` (`0` to disable), `UA_REFRESH_MS`, `PROBE_AUTH`, `RESPONSES_MODELS` (JSON), `RATE_LIMIT_MAX`, `RATE_LIMIT_WINDOW_MS`, `DEFAULT_MODEL`, `FALLBACK_MODELS` (JSON), `MODEL_ALIASES` (JSON), `PROXY_KEY`, `ZEN_KEY`, `TRUST_FORWARDED=1`, `TIMEOUT_MS`, `CACHE_MS`, `ZEN_PROXY_CONFIG` (custom config path).
+Env vars: `HOST`, `PORT`, `ZEN_URL`, `ZEN_UA`, `INJECT_SESSION` (`0` to disable), `AUTO_UA` (`0` to disable), `UA_REFRESH_MS`, `PROBE_AUTH`, `RESPONSES_MODELS` (JSON), `RATE_LIMIT_MAX`, `RATE_LIMIT_WINDOW_MS`, `DEFAULT_MODEL`, `FALLBACK_MODELS` (JSON), `MODEL_ALIASES` (JSON), `PROXY_KEY`, `ZEN_KEY`, `ZEN_KEYS`, `ZEN_KEYS_FILE`, `ZEN_KEYS_REFS`, `TRUST_FORWARDED=1`, `TIMEOUT_MS`, `CACHE_MS`, `ZEN_PROXY_CONFIG` (custom config path).
 
 ### bring your own key
 
-Anonymous `public` access rides opencode's shared free pool (per-IP quota, sometimes saturated). For stable, reliable use set `defaultZenKey` to your own free Zen key — or send it per request as `x-zen-key` / a non-`public` bearer token.
+Anonymous `public` access rides opencode's shared free pool (per-IP quota, sometimes saturated). For stable, reliable use set `defaultZenKey` to your own free Zen key — or send it per request as `x-zen-key` / a non-`public` bearer token. With more than one account (`zenKeys`, or the `refs` named in `zenKeysRefs` of `zenKeysFile`) requests start on the next account in turn, `401`/`429` hands the request to the following account, and the anonymous tier remains the last resort; `/api/status` reports the pool and each account's request count, masked.
 
 ---
 
@@ -197,6 +200,7 @@ Anonymous `public` access rides opencode's shared free pool (per-IP quota, somet
 |---|---|---|
 | `POST` | `/v1/chat/completions` | Chat completions (stream + non-stream) |
 | `POST` | `/v1/responses` | Responses passthrough |
+| `POST` | `/v1/systemone` | System One classifier (`jev-1.13-free`); body and reply relayed unchanged |
 | `GET` | `/v1/models` | Allowed models (cached) |
 | `GET` | `/health` | Health check |
 | `GET` | `/` | Dashboard |

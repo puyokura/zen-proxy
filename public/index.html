@@ -773,7 +773,9 @@ async function populateConfigForm() {
     const st = await api("/api/status")
     const auth = st.auth || {}
     const modeLabel =
-      auth.mode === "proxy+byok" ? "proxy key + your zen key"
+      auth.mode === "proxy+pool" ? `proxy key + ${auth.accounts ?? 2} zen accounts, round-robin`
+      : auth.mode === "pool" ? `${auth.accounts ?? 2} zen accounts, round-robin`
+      : auth.mode === "proxy+byok" ? "proxy key + your zen key"
       : auth.mode === "byok" ? "your zen key"
       : auth.mode === "proxy" ? "proxy key"
       : "anonymous public"

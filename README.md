@@ -85,10 +85,11 @@ It stays up until you stop it, so you point your agent at it once and keep using
 | `POST /v1/responses` | OpenAI Responses API, translated both ways |
 | `POST /v1/messages` | Anthropic Messages API — **this is the Claude Code one** |
 | `POST /v1/messages/count_tokens` | Anthropic token estimate |
+| `POST /v1/systemone` | System One classifier (`jev-1.13-free`) — request and reply relayed unchanged |
 | `GET /v1/models` | What's live right now |
 | Automatic fallback | Retries the next free model on `429` / `5xx` / unavailable |
 | Model aliases | Call it `gpt-4o`, get a free model back |
-| Auth | Anonymous `Bearer public`, or bring your own Zen key |
+| Auth | Anonymous `Bearer public`, your own Zen key, or several accounts rotated per request |
 | Dashboard | `http://127.0.0.1:8787/` |
 
 The free-model catalog in [`models.json`](models.json) is refreshed from OpenCode's public catalog by a GitHub Action every 6 hours.
@@ -152,15 +153,16 @@ The OpenAI-shaped routes get no name mapping, so they are handled differently: a
 | `modelAliases` | `{}` | e.g. `{"gpt-4o": "space-bunny-free"}` |
 | `responsesModels` | `["gpt-5*","gpt-6*","grok-*","muse-spark-*"]` | Models served on `/v1/responses`; patterns may end in `*` |
 | `defaultZenKey` | `""` | Your own Zen key instead of anonymous `public` |
+| `zenKeys` / `zenKeysFile` / `zenKeysRefs` | `[]` / `""` / `[]` | More Zen credentials: a key list, or the `refs:` names to read out of a credentials file such as `~/.dsh/.credentials.yaml`. Two or more accounts are rotated per request; a key answering `401`/`429` passes the request to the next one, and the anonymous tier stays the last resort. |
 | `proxyKey` | `""` | Require this from clients; also locks the dashboard and `/api/*` |
 | `rateLimitMax` / `rateLimitWindowMs` | `0` (off) / `60000` | Per-client rate limiting |
 | `timeoutMs` / `cacheMs` | `120000` / `30000` | Upstream timeout, `/v1/models` cache TTL |
 | `autoSync` / `autoSyncIntervalMs` | `true` / `3600000` | Runtime discovery of newly-offered free models |
 | `trustForwarded` | `false` | Honour `x-forwarded-for` behind a reverse proxy |
 
-`HOST` `PORT` `ZEN_URL` `ZEN_UA` `INJECT_SESSION=0` `AUTO_UA=0` `UA_REFRESH_MS` `AGENT_TOOLS=0` `PROBE_AUTH` `DEFAULT_MODEL` `FALLBACK_MODELS` `MODEL_ALIASES` `RESPONSES_MODELS` `PROXY_KEY` `ZEN_KEY` `TRUST_FORWARDED=1` `TIMEOUT_MS` `CACHE_MS` `RATE_LIMIT_MAX` `RATE_LIMIT_WINDOW_MS` `AUTO_SYNC=0` `AUTO_SYNC_MS` `ZEN_PROXY_CONFIG`
+`HOST` `PORT` `ZEN_URL` `ZEN_UA` `INJECT_SESSION=0` `AUTO_UA=0` `UA_REFRESH_MS` `AGENT_TOOLS=0` `PROBE_AUTH` `DEFAULT_MODEL` `FALLBACK_MODELS` `MODEL_ALIASES` `RESPONSES_MODELS` `PROXY_KEY` `ZEN_KEY` `ZEN_KEYS` `ZEN_KEYS_FILE` `ZEN_KEYS_REFS` `TRUST_FORWARDED=1` `TIMEOUT_MS` `CACHE_MS` `RATE_LIMIT_MAX` `RATE_LIMIT_WINDOW_MS` `AUTO_SYNC=0` `AUTO_SYNC_MS` `ZEN_PROXY_CONFIG`
 
-Anonymous `public` access shares a per-IP quota that is sometimes saturated. Set `defaultZenKey`, or send `x-zen-key` per request, for steadier service.
+Anonymous `public` access shares a per-IP quota that is sometimes saturated. Set `defaultZenKey`, or send `x-zen-key` per request, for steadier service. With several accounts configured (`zenKeys` or the refs of `zenKeysFile`) they are used in turn, so a per-account quota is no longer the ceiling; `/api/status` reports the pool and per-account request counts, masked.
 </details>
 
 <details>

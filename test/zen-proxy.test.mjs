@@ -157,7 +157,7 @@ beforeEach(() => {
   globalThis.fetch = originalFetch
   if (originalConfig) zp.saveConfig(originalConfig)
   Object.assign(zp.requestStats, { total: 0, errors: 0, recent: [], perMinute: new Map(), window60: [] })
-  Object.assign(zp.syncState, { at: 0, ok: false, running: false, ms: 0, working: [], rateLimited: [], flaky: [], dead: [], error: "" })
+  Object.assign(zp.syncState, { at: 0, ok: false, running: false, ms: 0, working: [], rateLimited: [], flaky: [], gated: [], systemone: [], dead: [], error: "" })
 })
 beforeEach(() => {
   originalConfig = snapshotConfig()
@@ -233,6 +233,164 @@ describe("authForUpstream", () => {
     zp.saveConfig({ proxyKey: "admin-1" })
     const req = mockReq({ headers: { authorization: "Bearer admin-1" } })
     assert.equal(zp.authForUpstream(req), "Bearer public")
+  })
+})
+
+describe("upstream credential pool", () => {
+  test("readRefsKeys reads only listed names inside the top-level refs block", () => {
+    const text = [
+      "version: 1",
+      "refs:",
+      "  OPENCODE_API_KEY: oc-one",
+      '  OPENCODE_API_KEY_2: "oc-two"',
+      "  OTHER_KEY: nope",
+      "records:",
+      "  nested:",
+      "    OPENCODE_API_KEY: not-this",
+      "",
+    ].join("\n")
+    assert.deepEqual(zp.readRefsKeys(text, ["OPENCODE_API_KEY", "OPENCODE_API_KEY_2"]), ["oc-one", "oc-two"])
+    assert.deepEqual(zp.readRefsKeys(text, ["OTHER_KEY"]), ["nope"])
+    assert.deepEqual(zp.readRefsKeys(text, ["nested"]), [])
+  })
+
+  test("poolKeys reads the named refs out of a credentials file and dedupes", () => {
+    const file = path.join(tmpDir, "creds-pool.yaml")
+    fs.writeFileSync(file, ["refs:", "  OPENCODE_API_KEY: shared", "  OPENCODE_API_KEY_2: second", ""].join("\n"))
+    zp.saveConfig({
+      defaultZenKey: "shared",
+      zenKeys: ["extra", "second"],
+      zenKeysFile: file,
+      zenKeysRefs: ["OPENCODE_API_KEY", "OPENCODE_API_KEY_2"],
+    })
+    assert.deepEqual(zp.poolKeys(), ["shared", "extra", "second"])
+  })
+
+  test("poolKeys ignores placeholder public and an unreadable file", () => {
+    zp.saveConfig({ defaultZenKey: "public", zenKeys: ["", "  ", "real"], zenKeysFile: path.join(tmpDir, "absent.yaml"), zenKeysRefs: ["A"] })
+    assert.deepEqual(zp.poolKeys(), ["real"])
+  })
+
+  test("a ref added later is picked up without a restart", () => {
+    const file = path.join(tmpDir, "creds-hot.yaml")
+    fs.writeFileSync(file, "refs:\n  A: first-key\n")
+    zp.saveConfig({ defaultZenKey: "", zenKeys: [], zenKeysFile: file, zenKeysRefs: ["A", "B"] })
+    assert.deepEqual(zp.poolKeys(), ["first-key"])
+    fs.writeFileSync(file, "refs:\n  A: first-key\n  B: second-key\n")
+    assert.deepEqual(zp.poolKeys(), ["first-key", "second-key"], "the second account appears without a restart")
+  })
+
+  test("successive requests start on different accounts (round-robin)", () => {
+    zp.saveConfig({ defaultZenKey: "", zenKeys: ["key-a", "key-b"], zenKeysFile: "", zenKeysRefs: [] })
+    const req = mockReq({ headers: {} })
+    const first = zp.upstreamAuths(req).auths[0]
+    const second = zp.upstreamAuths(req).auths[0]
+    assert.notEqual(first, second, "the second request starts on the other account")
+    assert.deepEqual([first, second].sort(), ["Bearer key-a", "Bearer key-b"])
+  })
+
+  test("a client key is used as sent and never rotated away", () => {
+    zp.saveConfig({ defaultZenKey: "", zenKeys: ["key-a", "key-b"], zenKeysFile: "", zenKeysRefs: [] })
+    const req = mockReq({ headers: { authorization: "Bearer sk-mine" } })
+    assert.deepEqual(zp.upstreamAuths(req).auths, ["Bearer sk-mine"])
+    assert.deepEqual(zp.upstreamAuths(req, true).auths.length, 3, "…unless the caller allows the pool to rescue it")
+  })
+
+  test("an unusable account falls back to the anonymous tier", async () => {
+    zp.saveConfig({ defaultZenKey: "", zenKeys: ["key-a"], zenKeysFile: "", zenKeysRefs: [], proxyKey: "", modelAliases: {} })
+    const calls = []
+    globalThis.fetch = async (url, opts = {}) => {
+      calls.push(opts.headers?.authorization)
+      if (opts.headers?.authorization !== "Bearer public") {
+        return jsonResponse({ error: { type: "AuthError", message: "invalid api key" } }, 401)
+      }
+      return jsonResponse({ model: "m", choices: [{ message: { role: "assistant", content: "anonymous tier" } }] })
+    }
+    const req = mockReq({ _body: JSON.stringify({ model: "beam-free", messages: [{ role: "user", content: "hi" }] }) })
+    const res = mockRes()
+    await zp.handleChat(req, res)
+    assert.equal(res.state.status, 200)
+    assert.deepEqual(calls, ["Bearer key-a", "Bearer public"])
+    assert.match(res.body, /anonymous tier/)
+  })
+
+  test("a rate-limited account is swapped for the next one on the same model", async () => {
+    zp.saveConfig({ defaultZenKey: "", zenKeys: ["key-a", "key-b"], proxyKey: "", zenKeysFile: "", zenKeysRefs: [] })
+    const calls = []
+    globalThis.fetch = async (url, opts = {}) => {
+      calls.push({ auth: opts.headers?.authorization, model: JSON.parse(opts.body).model })
+      if (calls.length === 1) {
+        return jsonResponse({ error: { type: "free_usage_limit_error", message: "rate limit exceeded" } }, 429)
+      }
+      return jsonResponse({ model: "m", choices: [{ message: { content: "served by the second account" } }] })
+    }
+    const req = mockReq({ _body: JSON.stringify({ model: "m", messages: [{ role: "user", content: "hi" }] }) })
+    const res = mockRes()
+    await zp.handleChat(req, res)
+    assert.equal(res.state.status, 200)
+    assert.equal(calls.length, 2, "one rejected account, one successful account")
+    assert.notEqual(calls[0].auth, calls[1].auth)
+    assert.equal(calls[0].model, calls[1].model, "the same model is retried, not skipped")
+    assert.match(res.body, /second account/)
+  })
+
+  test("key usage is reported per masked account, never as a raw key", () => {
+    zp.saveConfig({ defaultZenKey: "", zenKeys: ["aaaaaaaaaaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbbbbbbbbbb"], zenKeysFile: "", zenKeysRefs: [] })
+    zp.noteKeyUsed("Bearer aaaaaaaaaaaaaaaaaaaaaaaa", 200)
+    zp.noteKeyUsed("Bearer bbbbbbbbbbbbbbbbbbbbbbbb", 429)
+    const status = zp.keyPoolStatus()
+    assert.equal(status.accounts, 2)
+    assert.equal(status.rotation, "round-robin")
+    for (const label of Object.keys(status.usage)) {
+      assert.ok(!label.includes("aaaaaaaaaaaaaaaaaaaaaaaa"), "raw keys never appear")
+      assert.ok(label.includes("•"))
+    }
+  })
+})
+
+describe("System One route (jev)", () => {
+  test("systemoneURL derives the systemone endpoint from the chat base", () => {
+    zp.saveConfig({ upstream: "https://opencode.ai/inference/v1" })
+    assert.equal(zp.systemoneURL(), "https://opencode.ai/inference/systemone/v1/systemone")
+  })
+
+  test("forwards the body verbatim and relays the reply", async () => {
+    let seen = null
+    globalThis.fetch = async (url, opts = {}) => {
+      seen = { url: String(url), body: opts.body }
+      return jsonResponse({ model: "jev-1.13-free", values: { urgent: { value: true, probability: 0.91 } } })
+    }
+    const body = { model: "jev-1.13-free", state: "hello", questions: { urgent: { type: "noul", instructions: "urgent?" } } }
+    const req = mockReq({ _body: JSON.stringify(body), url: "/v1/systemone" })
+    const res = mockRes()
+    await zp.handleSystemone(req, res)
+    assert.equal(res.state.status, 200)
+    assert.equal(seen.url, zp.systemoneURL())
+    assert.deepEqual(JSON.parse(seen.body), body, "body is passed through unchanged")
+    assert.match(res.body, /probability/)
+  })
+
+  test("a chat request for jev is refused locally with a pointer at /v1/systemone", async () => {
+    zp.saveConfig({ fallbackModels: ["alpha-free", "jev-1.13-free"], modelAliases: {}, defaultModel: "" })
+    globalThis.fetch = async () => {
+      throw new Error("no upstream call may happen for a jev chat request")
+    }
+    const req = mockReq({ _body: JSON.stringify({ model: "jev-1.13-free", messages: [{ role: "user", content: "hi" }] }) })
+    const res = mockRes()
+    await zp.handleChat(req, res)
+    assert.equal(res.state.status, 400)
+    assert.match(res.body, /\/v1\/systemone/)
+  })
+
+  test("jev is never picked as the default or a chat fallback", () => {
+    zp.saveConfig({ fallbackModels: ["jev-1.13-free", "alpha-free"], modelAliases: {}, defaultModel: "" })
+    assert.equal(zp.effectiveDefault(), "alpha-free")
+    assert.equal(zp.resolveModel("alpha-free").candidates.includes("jev-1.13-free"), false)
+  })
+
+  test("isSystemoneOnly matches jev ids only", () => {
+    assert.equal(zp.isSystemoneOnly("jev-1.13-free"), true)
+    assert.equal(zp.isSystemoneOnly("alpha-free"), false)
   })
 })
 
@@ -1663,13 +1821,32 @@ describe("shipped model catalog (models.json)", () => {
     assert.equal(typeof parsed.upstream, "string")
   })
 
-  test("every shipped id is routable and inside the safe charset", () => {
+  test("shipped ids stay in the safe charset and split into chat and systemone", () => {
     const { models } = JSON.parse(fs.readFileSync(REPO_MODELS, "utf8"))
+    for (const id of models) assert.match(id, /^[A-Za-z0-9._:@+/%-]+$/)
+    assert.equal(new Set(models).size, models.length, "no duplicates")
     for (const id of models) {
-      assert.match(id, /^[A-Za-z0-9._:@+/%-]+$/)
-      assert.ok(!/^jev-/.test(id), `jev-* is served on /systemone, not chat: ${id}`)
-      assert.equal(new Set(models).size, models.length, "no duplicates")
+      assert.equal(zp.isSystemoneOnly(id), /^jev-/.test(id), `${id} is routed by its endpoint family`)
     }
+    assert.ok(models.some((id) => /^jev-/.test(id)), "the free classifier is catalogued")
+    assert.ok(models.some((id) => !/^jev-/.test(id)), "chat models stay in the catalog")
+  })
+
+  test("a systemone model survives sync without being probed on chat", async () => {
+    zp.saveConfig({ fallbackModels: ["alpha-free", "jev-1.13-free"], modelAliases: {}, autoSyncIntervalMs: 0, cacheMs: 0 })
+    const probed = []
+    globalThis.fetch = async (url, opts = {}) => {
+      const u = String(url)
+      probed.push(u)
+      if (u.endsWith("/models")) return jsonResponse({ data: [{ id: "alpha-free" }, { id: "jev-1.13-free" }] })
+      const body = JSON.parse(opts.body)
+      assert.notEqual(body.model, "jev-1.13-free", "a classifier must not be probed as a chat model")
+      return jsonResponse({ model: body.model, choices: [] })
+    }
+    const s = await zp.syncModels()
+    assert.ok(s.systemone.includes("jev-1.13-free"), "reported in its own bucket")
+    assert.ok(zp.config.fallbackModels.includes("jev-1.13-free"), "kept, because the catalog lists it")
+    assert.ok(!probed.some((u) => u.includes("/systemone")), "no synthetic classifier probe")
   })
 
   test("the proxy reads its list from models.json", () => {
@@ -1909,9 +2086,9 @@ describe("model-sync bot (scripts/sync-models.mjs)", () => {
     assert.deepEqual(r.catalog.models, ["alpha-free", "big-pickle"])
   })
 
-  test("never lists jev-* (served on /systemone, not chat)", async () => {
+  test("lists jev-* (free, served on /v1/systemone rather than chat)", async () => {
     const r = await runBot({ start: null, upstream: ["alpha-free", "jev-1.13-free", "jev-9-free"] })
-    assert.deepEqual(r.catalog.models, ["alpha-free"])
+    assert.deepEqual(r.catalog.models, ["alpha-free", "jev-1.13-free", "jev-9-free"])
   })
 
   test("keeps only ids inside the safe charset", async () => {
@@ -1974,6 +2151,23 @@ describe("Anthropic Messages API layer", () => {
       return { status: res.state.status, body: res.body }
     }
   }
+
+  test("a placeholder client token is rescued by the configured accounts", async () => {
+    // Claude Code sends whatever ANTHROPIC_AUTH_TOKEN holds. That token is tried
+    // first, and when upstream rejects it the configured accounts take over —
+    // the request must not die on a placeholder.
+    zp.saveConfig({ proxyKey: "", defaultZenKey: "", zenKeys: ["key-a", "key-b"], zenKeysFile: "", zenKeysRefs: [] })
+    const calls = []
+    globalThis.fetch = async (url, opts = {}) => {
+      calls.push(opts.headers?.authorization)
+      if (calls.length === 1) return jsonResponse({ error: { type: "AuthError", message: "invalid api key" } }, 401)
+      return jsonResponse({ model: "m", choices: [{ message: { role: "assistant", content: "ok" } }] })
+    }
+    const out = await callRoute(req({ model: "m", max_tokens: 16, messages: [{ role: "user", content: "hi" }] }, { authorization: "Bearer placeholder" }))
+    assert.equal(out.status, 200)
+    assert.equal(calls[0], "Bearer placeholder", "the client token is tried first")
+    assert.ok(["Bearer key-a", "Bearer key-b"].includes(calls[1]), `the pool rescues it, got ${calls[1]}`)
+  })
 
   test("system blocks and message blocks flatten into chat messages", () => {
     const out = zp.anthropicToChatBody(
