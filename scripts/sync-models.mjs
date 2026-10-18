@@ -29,6 +29,10 @@ const UA = process.env.ZEN_UA ?? "opencode/1.18.35"
 // Free models that do not carry the `-free` suffix. `big-pickle` is a stealth
 // model that upstream prices at zero, so a plain suffix filter would drop it.
 const KNOWN_FREE = new Set(["big-pickle"])
+// Models that are NOT reachable through /chat/completions or /responses.
+// jev-* is served on /v1/systemone (structured classification), so listing it
+// here could only ever produce a failed request.
+const NOT_CHAT_SERVABLE = [/^jev-/]
 
 // Keeps whitespace, quotes, backslashes and shell metacharacters out of the
 // catalog. `/` and `.` are allowed — provider-qualified ids use them
@@ -59,11 +63,8 @@ async function fetchUpstreamModels() {
   return (parsed.data ?? []).map((m) => m?.id).filter((id) => typeof id === "string")
 }
 
-// Endpoint family is not a listing criterion: jev-* is free and the proxy
-// serves it on its own route (/v1/systemone), so it is catalogued like any
-// other free model.
 function isFree(id) {
-  return VALID_MODEL_ID.test(id) && (id.endsWith("-free") || KNOWN_FREE.has(id))
+  return VALID_MODEL_ID.test(id) && !NOT_CHAT_SERVABLE.some((re) => re.test(id)) && (id.endsWith("-free") || KNOWN_FREE.has(id))
 }
 
 async function main() {

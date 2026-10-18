@@ -100,6 +100,9 @@ function mockRes() {
       state.status = status
       Object.assign(state.headers, headers)
     },
+    setHeader(name, value) {
+      state.headers[String(name).toLowerCase()] = value
+    },
     write(chunk) {
       state.chunks.push(String(chunk))
     },
@@ -514,10 +517,36 @@ describe("retryableUpstream", () => {
     assert.equal(zp.retryableUpstream(401, { error: { type: "ModelError", message: "Model hy3-free is not supported" } }), true)
   })
 
+  test("retired models (410 Gone / deprecated) are retryable", () => {
+    // The chain must keep walking past a model upstream retired; surfacing its
+    // "has been deprecated" error was a real user-visible failure.
+    assert.equal(zp.retryableUpstream(410, { error: { type: "ModelDeprecated", message: "The model ll-alpha-free has been deprecated and is no longer available." } }), true)
+    assert.equal(zp.retryableUpstream(400, { error: { message: "this model is no longer available" } }), true)
+  })
+
   test("plain client errors are not retryable", () => {
     assert.equal(zp.retryableUpstream(400, { error: { message: "bad request" } }), false)
     assert.equal(zp.retryableUpstream(401, { error: { message: "invalid api key" } }), false)
     assert.equal(zp.retryableUpstream(400, { error: { type: "invalid_request_error" } }), false)
+  })
+})
+
+describe("transientUpstream", () => {
+  test("429, 5xx and provider hiccups are transient (same-model retry)", () => {
+    assert.equal(zp.transientUpstream(429, {}), true)
+    assert.equal(zp.transientUpstream(500, {}), true)
+    assert.equal(zp.transientUpstream(502, {}), true)
+    assert.equal(zp.transientUpstream(400, { error: { type: "server_error", message: "hiccup" } }), true)
+    assert.equal(zp.transientUpstream(502, { error: { type: "upstream_error" } }), true)
+  })
+
+  test("deterministic model verdicts are not transient", () => {
+    // Retrying these against the same model cannot help: the gate says no, the
+    // geo block says no, the id is retired. They go straight to the next model.
+    assert.equal(zp.transientUpstream(403, { error: { type: "FreeTierError", message: "free tier can only be used within OpenCode" } }), false)
+    assert.equal(zp.transientUpstream(403, { error: { type: "RegionError", message: "not available in your country" } }), false)
+    assert.equal(zp.transientUpstream(410, { error: { type: "ModelDeprecated", message: "deprecated" } }), false)
+    assert.equal(zp.transientUpstream(400, { error: { type: "invalid_request_error", message: "bad body" } }), false)
   })
 })
 
@@ -608,6 +637,27 @@ describe("sync prunes unsupported models", () => {
     assert.ok(zp.config.fallbackModels.includes("mimo-v2.5-free"), "healthy model kept")
   })
 
+  test("410 Gone / deprecated model is pruned immediately", async () => {
+    // ll-alpha-free case: upstream retires the id with 410 "has been deprecated".
+    // It must leave the user's list on the first sync, not linger for three
+    // consecutive failures while every request that reaches it breaks.
+    zp.saveConfig({ fallbackModels: ["space-bunny-free", "ll-alpha-free"], defaultModel: "", autoSyncIntervalMs: 0, cacheMs: 0 })
+    globalThis.fetch = routeFetch([
+      ["/models", jsonResponse({ data: [{ id: "space-bunny-free" }] })],
+      [
+        "/chat/completions",
+        (u, opts) =>
+          JSON.parse(opts.body).model === "ll-alpha-free"
+            ? jsonResponse({ error: { type: "ModelDeprecated", message: "The model ll-alpha-free has been deprecated and is no longer available." } }, 410)
+            : jsonResponse({ model: "ok", choices: [] }),
+      ],
+    ])
+    const s = await zp.syncModels()
+    assert.equal(s.ok, true)
+    assert.ok(s.dead.includes("ll-alpha-free"), "reported dead")
+    assert.deepEqual(zp.config.fallbackModels, ["space-bunny-free"], "deprecated model removed from config")
+  })
+
   test("auth failures never punish healthy models", async () => {
     zp.saveConfig({ fallbackModels: ["mimo-v2.5-free"], autoSyncIntervalMs: 0, cacheMs: 0 })
     globalThis.fetch = routeFetch([
@@ -638,7 +688,7 @@ describe("sync prunes unsupported models", () => {
       assert.equal(s.ok, true)
       assert.deepEqual([...zp.config.fallbackModels].sort(), [...list].sort(), `config intact after sync #${i + 1}`)
       assert.ok(!s.dead.includes("mimo-v2.5-free"), "temporary block is not 'dead'")
-      assert.ok(s.gated.includes("mimo-v2.5-free"), "reported as agent-only (gated), not flaky")
+      assert.ok(s.gated.includes("mimo-v2.5-free"), "reported as gate-blocked, not flaky")
     }
   })
 
@@ -686,7 +736,7 @@ describe("sync prunes unsupported models", () => {
     assert.ok(zp.config.fallbackModels.includes("space-bunny-free"), "working model kept")
   })
 
-  test("free-tier gated models are still added, since agents can use them", async () => {
+  test("models the gate refuses even for agent-shaped probes are still added", async () => {
     zp.saveConfig({ fallbackModels: [], autoSyncIntervalMs: 0, cacheMs: 0 })
     globalThis.fetch = routeFetch([
       ["/models", () => jsonResponse({ data: [{ id: "gated-flash-free" }] })],
@@ -694,8 +744,66 @@ describe("sync prunes unsupported models", () => {
     ])
     const s = await zp.syncModels()
     assert.equal(s.ok, true)
-    assert.ok(s.gated.includes("gated-flash-free"), "reported as agent-only")
-    assert.ok(zp.config.fallbackModels.includes("gated-flash-free"), "added, because real agents can use it")
+    assert.ok(s.gated.includes("gated-flash-free"), "reported as gate-blocked")
+    assert.ok(zp.config.fallbackModels.includes("gated-flash-free"), "added, because the block can lift")
+  })
+
+  test("health probes are agent-shaped, so the gate accepts them", async () => {
+    // The real gate refuses requests without opencode's tool manifest or
+    // without streaming; this mock does the same. Bare pings used to land
+    // every model in gated, which told the user nothing about whether it
+    // actually works.
+    const list = ["space-bunny-free", "mimo-v2.5-free"]
+    zp.saveConfig({ fallbackModels: [...list], defaultModel: "", autoSyncIntervalMs: 0, cacheMs: 0 })
+    const seen = []
+    globalThis.fetch = routeFetch([
+      ["/models", () => jsonResponse({ data: list.map((id) => ({ id })) })],
+      [
+        "/chat/completions",
+        (u, opts) => {
+          const body = JSON.parse(opts.body)
+          seen.push(body)
+          const agentShaped = body.stream === true && Array.isArray(body.tools) && body.tools.length > 0
+          return agentShaped
+            ? jsonResponse({ model: "ok", choices: [] })
+            : jsonResponse({ type: "error", error: { type: "FreeTierError", message: "free tier can only be used from within OpenCode" } }, 403)
+        },
+      ],
+    ])
+    const s = await zp.syncModels()
+    assert.equal(s.ok, true)
+    assert.deepEqual([...s.working].sort(), [...list].sort(), "both models probe as genuinely working")
+    assert.equal(s.gated.length, 0, "nothing is written off as gate-blocked")
+    assert.ok(seen.length >= 2 && seen.every((b) => b.stream === true), "every probe streams")
+    assert.ok(seen.every((b) => b.tools?.length > 0), "every probe carries the tool manifest")
+    assert.ok(seen.every((b) => b.tool_choice === "none"), "ping replies stay plain text, not tool calls")
+  })
+
+  test("responses-format models get an agent-shaped probe on /responses", async () => {
+    zp.saveConfig({
+      fallbackModels: ["muse-spark-1.3-contributor-free"],
+      responsesModels: ["gpt-5*", "gpt-6*", "grok-*", "muse-spark-*"],
+      defaultModel: "",
+      autoSyncIntervalMs: 0,
+      cacheMs: 0,
+    })
+    let sentBody
+    globalThis.fetch = routeFetch([
+      ["/models", () => jsonResponse({ data: [] })],
+      [
+        "/responses",
+        (u, opts) => {
+          sentBody = JSON.parse(opts.body)
+          return jsonResponse({ model: "ok" })
+        },
+      ],
+    ])
+    const s = await zp.syncModels()
+    assert.ok(s.working.includes("muse-spark-1.3-contributor-free"), "reported working")
+    assert.equal(sentBody.stream, true, "responses probe streams too")
+    assert.ok(sentBody.tools?.length > 0, "responses probe carries converted tools")
+    assert.equal(sentBody.input, "ping")
+    assert.ok(!("tool_choice" in sentBody), "responses payload stays in responses dialect")
   })
 })
 
@@ -733,6 +841,124 @@ describe("fallback transparency", () => {
   })
 })
 
+describe("same-model retries (the chosen model is tried first)", () => {
+  // The user's chosen model must serve the request. Transient failures get
+  // retried against that same model; only when it really gives up does the
+  // chain fall back — and the final error still describes the chosen model.
+  const base = { defaultModel: "", autoSyncIntervalMs: 0, cacheMs: 0, retriesPerModel: 2, retryBackoffMs: 1 }
+
+  test("transient failures retry the chosen model and never call another", async () => {
+    zp.saveConfig({ ...base, fallbackModels: ["big-pickle", "space-bunny-free"] })
+    const calls = []
+    globalThis.fetch = routeFetch([
+      [
+        "/chat/completions",
+        (u, opts) => {
+          const sent = JSON.parse(opts.body)
+          calls.push(sent.model)
+          if (calls.length < 3) return jsonResponse({ error: { type: "server_error", message: "temporary hiccup" } }, 502)
+          return jsonResponse({ model: sent.model, choices: [{ message: { role: "assistant", content: "ok" } }] })
+        },
+      ],
+    ])
+    const req = mockReq({ _body: JSON.stringify({ model: "big-pickle", messages: [] }) })
+    const res = mockRes()
+    await zp.handleChat(req, res)
+    assert.equal(res.state.status, 200)
+    assert.deepEqual(calls, ["big-pickle", "big-pickle", "big-pickle"], "only the chosen model was called")
+    assert.equal(res.state.headers["x-zen-served-by"], undefined, "no fallback happened")
+  })
+
+  test("retries exhausted → chain falls back once", async () => {
+    zp.saveConfig({ ...base, fallbackModels: ["big-pickle", "space-bunny-free"] })
+    const calls = []
+    globalThis.fetch = routeFetch([
+      [
+        "/chat/completions",
+        (u, opts) => {
+          const sent = JSON.parse(opts.body)
+          calls.push(sent.model)
+          if (sent.model === "big-pickle") return jsonResponse({ error: { type: "server_error", message: "down" } }, 502)
+          return jsonResponse({ model: sent.model, choices: [{ message: { role: "assistant", content: "ok" } }] })
+        },
+      ],
+    ])
+    const req = mockReq({ _body: JSON.stringify({ model: "big-pickle", messages: [] }) })
+    const res = mockRes()
+    await zp.handleChat(req, res)
+    assert.equal(res.state.status, 200)
+    assert.deepEqual(calls, ["big-pickle", "big-pickle", "big-pickle", "space-bunny-free"], "1 + 2 retries, then one fallback")
+    assert.equal(res.state.headers["x-zen-served-by"], "space-bunny-free")
+    assert.equal(res.state.headers["x-zen-fallback"], "true")
+    assert.equal(JSON.parse(res.body).zen_served_by, "space-bunny-free")
+  })
+
+  test("deterministic gate failures skip same-model retries but still fall back", async () => {
+    zp.saveConfig({ ...base, fallbackModels: ["big-pickle", "space-bunny-free"] })
+    const calls = []
+    globalThis.fetch = routeFetch([
+      [
+        "/chat/completions",
+        (u, opts) => {
+          const sent = JSON.parse(opts.body)
+          calls.push(sent.model)
+          if (sent.model === "big-pickle") {
+            return jsonResponse({ type: "error", error: { type: "FreeTierError", message: "free tier can only be used within OpenCode" } }, 403)
+          }
+          return jsonResponse({ model: sent.model, choices: [{ message: { role: "assistant", content: "ok" } }] })
+        },
+      ],
+    ])
+    const req = mockReq({ _body: JSON.stringify({ model: "big-pickle", messages: [] }) })
+    const res = mockRes()
+    await zp.handleChat(req, res)
+    assert.equal(res.state.status, 200)
+    assert.deepEqual(calls, ["big-pickle", "space-bunny-free"], "retrying a gate 403 would just waste time")
+  })
+
+  test("retriesPerModel: 0 disables same-model retries", async () => {
+    zp.saveConfig({ ...base, retriesPerModel: 0, fallbackModels: ["big-pickle", "space-bunny-free"] })
+    const calls = []
+    globalThis.fetch = routeFetch([
+      [
+        "/chat/completions",
+        (u, opts) => {
+          const sent = JSON.parse(opts.body)
+          calls.push(sent.model)
+          if (sent.model === "big-pickle") return jsonResponse({ error: { type: "server_error", message: "down" } }, 502)
+          return jsonResponse({ model: sent.model, choices: [{ message: { role: "assistant", content: "ok" } }] })
+        },
+      ],
+    ])
+    const req = mockReq({ _body: JSON.stringify({ model: "big-pickle", messages: [] }) })
+    const res = mockRes()
+    await zp.handleChat(req, res)
+    assert.equal(res.state.status, 200)
+    assert.deepEqual(calls, ["big-pickle", "space-bunny-free"])
+  })
+
+  test("when everything fails, the error is the chosen model's, not the chain tail's", async () => {
+    zp.saveConfig({ ...base, retriesPerModel: 0, fallbackModels: ["big-pickle", "space-bunny-free"] })
+    globalThis.fetch = routeFetch([
+      [
+        "/chat/completions",
+        (u, opts) => {
+          const sent = JSON.parse(opts.body)
+          if (sent.model === "big-pickle") {
+            return jsonResponse({ error: { type: "free_usage_limit_error", message: "CHOSEN BUSY NOW" } }, 429)
+          }
+          return jsonResponse({ error: { type: "ModelDeprecated", message: "The model space-bunny-free has been deprecated" } }, 410)
+        },
+      ],
+    ])
+    const req = mockReq({ _body: JSON.stringify({ model: "big-pickle", messages: [] }) })
+    const res = mockRes()
+    await zp.handleChat(req, res)
+    assert.equal(res.state.status, 429, "not the tail model's 410")
+    assert.equal(JSON.parse(res.body).error.message, "CHOSEN BUSY NOW")
+  })
+})
+
 describe("auth visibility & key test", () => {
   test("/api/status reports the effective auth mode", async () => {
     zp.saveConfig({ defaultZenKey: "", proxyKey: "" })
@@ -750,14 +976,16 @@ describe("auth visibility & key test", () => {
     assert.ok(!JSON.parse(JSON.stringify(st.auth)).zenKey.includes("zen-secret"), "key masked")
   })
 
-  test("/api/test sends an explicit zenKey override", async () => {
+  test("/api/test sends an agent-shaped probe and an explicit zenKey override", async () => {
     const m = zp.config.fallbackModels[0]
     let sentAuth
+    let sentBody
     globalThis.fetch = routeFetch([
       [
         "/chat/completions",
         (u, opts) => {
           sentAuth = opts.headers["authorization"]
+          sentBody = JSON.parse(opts.body)
           return jsonResponse({ model: "ok", choices: [] })
         },
       ],
@@ -767,6 +995,9 @@ describe("auth visibility & key test", () => {
     await zp.handleTest(req, res)
     assert.equal(res.state.status, 200)
     assert.equal(sentAuth, "Bearer sk-custom-zen-key")
+    assert.equal(sentBody.stream, true, "probe streams like a real client")
+    assert.ok(sentBody.tools?.length > 0, "probe carries opencode's tool manifest")
+    assert.equal(sentBody.tool_choice, "none", "ping answers stay plain text")
   })
 })
 
@@ -1049,7 +1280,7 @@ describe("model list self-healing", () => {
     ])
     const s = await zp.syncModels()
     assert.equal(s.ok, true)
-    assert.ok(s.gated.includes("blocked-flash-free"), "reported as agent-only, not flaky")
+    assert.ok(s.gated.includes("blocked-flash-free"), "reported as gate-blocked, not flaky")
     assert.ok(zp.config.fallbackModels.includes("blocked-flash-free"), "but still added to the list so it can recover")
   })
 
@@ -1092,7 +1323,7 @@ describe("restore model list", () => {
 })
 
 describe("test endpoint honest reporting", () => {
-  test("free-tier gate is reported as agent-only, not as a failure", async () => {
+  test("free-tier gate refusing even an agent-shaped probe is reported as gated, not as a failure", async () => {
     const m = zp.config.fallbackModels[0]
     globalThis.fetch = routeFetch([
       [
@@ -1132,6 +1363,7 @@ describe("test endpoint honest reporting", () => {
 
 describe("handleTest body size", () => {
   test("mid-stream abort: oversized body rejected before stream fully drained", async () => {
+    zp.saveConfig({ maxBodyBytes: 1024 * 1024 })
     const chunk = "x".repeat(100 * 1024)
     const chunks = Array.from({ length: 20 }, () => chunk)
     const req = mockStreamingReq(chunks, { method: "POST" })
@@ -1257,9 +1489,30 @@ describe("handleChat", () => {
     assert.equal(res.state.status, 400)
   })
 
+  // Body-size limits are configurable (`maxBodyBytes`); the tests pin a small
+  // limit so multi-megabyte bodies stay fast, and one pin proves the shipped
+  // default is big enough for real compaction payloads.
+  const smallBodyLimit = 64 * 1024
+  const jsonBodySize = JSON.stringify({ model: "m", messages: [{ role: "user", content: "" }] }).length
+
+  test("default body limit accepts compaction-sized transcripts", () => {
+    assert.equal(zp.maxBodyBytes(), zp.MAX_BODY, "unset maxBodyBytes keeps the shipped default")
+    assert.ok(zp.MAX_BODY >= 16 * 1024 * 1024, `default ${zp.MAX_BODY} must fit multi-MB compactions`)
+  })
+
+  test("a 3MB body passes under the default limit", async () => {
+    globalThis.fetch = routeFetch([["/chat/completions", jsonResponse({ model: "ok", choices: [] })]])
+    const big = JSON.stringify({ model: "m", messages: [{ role: "user", content: "x".repeat(3 * 1024 * 1024) }] })
+    const req = mockReq({ _body: big })
+    const res = mockRes()
+    await zp.handleChat(req, res)
+    assert.equal(res.state.status, 200)
+  })
+
   test("oversized body → 413", async () => {
+    zp.saveConfig({ maxBodyBytes: smallBodyLimit })
     globalThis.fetch = routeFetch([["/chat/completions", jsonResponse({ model: "ok" })]])
-    const big = JSON.stringify({ model: "m", messages: [{ role: "user", content: "x".repeat(1024 * 1024 + 100) }] })
+    const big = JSON.stringify({ model: "m", messages: [{ role: "user", content: "x".repeat(smallBodyLimit + 100) }] })
     const req = mockReq({ _body: big })
     const res = mockRes()
     await zp.handleChat(req, res)
@@ -1267,10 +1520,11 @@ describe("handleChat", () => {
   })
 
   test("mid-stream abort: oversized body is rejected before the stream is fully drained", async () => {
+    zp.saveConfig({ maxBodyBytes: 1024 * 1024 })
     globalThis.fetch = routeFetch([["/chat/completions", jsonResponse({ model: "ok" })]])
-    // 20 chunks of 100KB = ~2MB total, well over MAX_BODY (1MB). Each chunk is
-    // small relative to MAX_BODY so the overflow is detected partway through,
-    // not on the first or last chunk.
+    // 20 chunks of 100KB = ~2MB total, well over the 1MB configured limit. Each
+    // chunk is small relative to the limit so the overflow is detected partway
+    // through, not on the first or last chunk.
     const chunk = "x".repeat(100 * 1024)
     const chunks = Array.from({ length: 20 }, () => chunk)
     const req = mockStreamingReq(chunks)
@@ -1281,37 +1535,48 @@ describe("handleChat", () => {
     assert.equal(req.pulled.finished, false, "generator must not run to completion")
   })
 
-  test("body exactly at MAX_BODY → not rejected for size", async () => {
+  test("body exactly at the configured limit → not rejected for size", async () => {
+    zp.saveConfig({ maxBodyBytes: smallBodyLimit })
+    const limit = zp.maxBodyBytes()
     globalThis.fetch = routeFetch([["/chat/completions", jsonResponse({ model: "ok" })]])
-    const pad = "x".repeat(zp.MAX_BODY - JSON.stringify({ model: "m", messages: [{ role: "user", content: "" }] }).length)
+    const pad = "x".repeat(limit - jsonBodySize)
     const body = JSON.stringify({ model: "m", messages: [{ role: "user", content: pad }] })
-    assert.equal(body.length, zp.MAX_BODY, "sanity: body is exactly MAX_BODY")
+    assert.equal(body.length, limit, "sanity: body is exactly the limit")
     const req = mockReq({ _body: body })
     const res = mockRes()
     await zp.handleChat(req, res)
     assert.notEqual(res.state.status, 413)
   })
 
-  test("body one byte over MAX_BODY → 413", async () => {
+  test("body one byte over the configured limit → 413", async () => {
+    zp.saveConfig({ maxBodyBytes: smallBodyLimit })
+    const limit = zp.maxBodyBytes()
     globalThis.fetch = routeFetch([["/chat/completions", jsonResponse({ model: "ok" })]])
-    const pad = "x".repeat(zp.MAX_BODY - JSON.stringify({ model: "m", messages: [{ role: "user", content: "" }] }).length + 1)
+    const pad = "x".repeat(limit - jsonBodySize + 1)
     const body = JSON.stringify({ model: "m", messages: [{ role: "user", content: pad }] })
-    assert.equal(body.length, zp.MAX_BODY + 1, "sanity: body is MAX_BODY + 1")
+    assert.equal(body.length, limit + 1, "sanity: body is limit + 1")
     const req = mockReq({ _body: body })
     const res = mockRes()
     await zp.handleChat(req, res)
     assert.equal(res.state.status, 413)
   })
 
-  test("body one byte under MAX_BODY → not 413", async () => {
+  test("body one byte under the configured limit → not 413", async () => {
+    zp.saveConfig({ maxBodyBytes: smallBodyLimit })
+    const limit = zp.maxBodyBytes()
     globalThis.fetch = routeFetch([["/chat/completions", jsonResponse({ model: "ok" })]])
-    const pad = "x".repeat(zp.MAX_BODY - JSON.stringify({ model: "m", messages: [{ role: "user", content: "" }] }).length - 1)
+    const pad = "x".repeat(limit - jsonBodySize - 1)
     const body = JSON.stringify({ model: "m", messages: [{ role: "user", content: pad }] })
-    assert.equal(body.length, zp.MAX_BODY - 1, "sanity: body is MAX_BODY - 1")
+    assert.equal(body.length, limit - 1, "sanity: body is limit - 1")
     const req = mockReq({ _body: body })
     const res = mockRes()
     await zp.handleChat(req, res)
     assert.notEqual(res.state.status, 413)
+  })
+
+  test("maxBodyBytes: 0 falls back to the shipped default", async () => {
+    zp.saveConfig({ maxBodyBytes: 0 })
+    assert.equal(zp.maxBodyBytes(), zp.MAX_BODY)
   })
 
   test("wrong proxy key → 401", async () => {
@@ -1370,6 +1635,7 @@ describe("handleChat", () => {
   })
 
   test("falls back to next candidate on 429", async () => {
+    zp.saveConfig({ retriesPerModel: 0 }) // retry-then-fallback is covered in its own describe
     const [m1, m2] = zp.config.fallbackModels
     let calls = []
     globalThis.fetch = routeFetch([
@@ -1415,6 +1681,7 @@ describe("handleChat", () => {
   })
 
   test("falls back to next candidate when a 400 says the model is unavailable", async () => {
+    zp.saveConfig({ retriesPerModel: 0 })
     const [m1, m2] = zp.config.fallbackModels
     let calls = []
     globalThis.fetch = routeFetch([
@@ -1477,6 +1744,146 @@ describe("handleChat", () => {
     assert.equal(res.state.status, 200)
     assert.match(res.body, new RegExp(`"model":"${m.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}"`))
     assert.ok(res.body.includes("data: [DONE]"))
+  })
+})
+
+describe("non-streaming requests are collected from upstream streams", () => {
+  // The free-tier gate only serves streaming traffic: a non-streaming request
+  // gets 403 FreeTierError from every model, which used to walk the whole chain
+  // and mark every model failed. The proxy now streams upstream regardless and
+  // reassembles the client's requested shape.
+  test("a non-stream chat request streams upstream and reassembles JSON", async () => {
+    const m = zp.config.fallbackModels[0]
+    let sentStream = null
+    globalThis.fetch = routeFetch([
+      [
+        "/chat/completions",
+        (u, opts) => {
+          const sent = JSON.parse(opts.body)
+          assert.equal(sent.model, m)
+          sentStream = sent.stream
+          return sseResponse(["Hel", "lo, ", "world"], "upstream-model")
+        },
+      ],
+    ])
+    const req = mockReq({ _body: JSON.stringify({ model: m, messages: [{ role: "user", content: "hi" }] }) })
+    const res = mockRes()
+    await zp.handleChat(req, res)
+    assert.equal(sentStream, true, "the gate only serves streams, so upstream must see one")
+    assert.equal(res.state.status, 200)
+    assert.match(res.state.headers["content-type"], /application\/json/)
+    const body = JSON.parse(res.body)
+    assert.equal(body.object, "chat.completion")
+    assert.equal(body.choices[0].message.role, "assistant")
+    assert.equal(body.choices[0].message.content, "Hello, world")
+    assert.equal(body.model, m, "the model is rewritten to the requested one")
+  })
+
+  test("bridge tool calls the caller never offered are stripped from the reassembled reply", async () => {
+    const m = zp.config.fallbackModels[0]
+    globalThis.fetch = routeFetch([
+      [
+        "/chat/completions",
+        (u, opts) => {
+          assert.equal(JSON.parse(opts.body).stream, true)
+          const toolStart = { index: 0, id: "call_1", type: "function", function: { name: "read", arguments: '{"pa' } }
+          const toolMore = { index: 0, function: { arguments: 'th":"a"}' } }
+          const blocks = [
+            { model: "u", choices: [{ delta: { tool_calls: [toolStart] } }] },
+            { model: "u", choices: [{ delta: { tool_calls: [toolMore] }, finish_reason: "tool_calls" }] },
+          ]
+          return new Response(blocks.map((b) => `data: ${JSON.stringify(b)}\n\n`).join("") + "data: [DONE]\n\n", {
+            status: 200,
+            headers: { "content-type": "text/event-stream" },
+          })
+        },
+      ],
+    ])
+    const req = mockReq({ _body: JSON.stringify({ model: m, messages: [{ role: "user", content: "hi" }] }) })
+    const res = mockRes()
+    await zp.handleChat(req, res)
+    const body = JSON.parse(res.body)
+    assert.equal(body.choices[0].message.tool_calls, undefined, "the caller offered no tools, so none may come back")
+    assert.equal(body.choices[0].finish_reason, "stop")
+  })
+
+  test("/v1/messages non-stream reassembles an upstream stream into Anthropic shape", async () => {
+    const m = zp.config.fallbackModels[0]
+    let sentStream = null
+    globalThis.fetch = routeFetch([
+      [
+        "/chat/completions",
+        (u, opts) => {
+          sentStream = JSON.parse(opts.body).stream
+          return sseResponse(["hi ", "there"], "upstream-model")
+        },
+      ],
+    ])
+    const req = mockReq({
+      url: "/v1/messages",
+      _body: JSON.stringify({ model: m, max_tokens: 16, messages: [{ role: "user", content: "hi" }] }),
+    })
+    const res = mockRes()
+    await zp.handleMessages(req, res)
+    assert.equal(sentStream, true)
+    assert.equal(res.state.status, 200)
+    const body = JSON.parse(res.body)
+    assert.equal(body.type, "message")
+    assert.equal(body.role, "assistant")
+    assert.equal(body.content[0].type, "text")
+    assert.equal(body.content[0].text, "hi there")
+    assert.equal(body.stop_reason, "end_turn")
+  })
+
+  test("a non-stream responses-format request takes the response.completed event", async () => {
+    const m = "muse-spark-1.3-contributor-free"
+    zp.saveConfig({ responsesModels: ["muse-spark-*"], fallbackModels: [m], defaultModel: m })
+    let sentStream = null
+    globalThis.fetch = routeFetch([
+      [
+        "/responses",
+        (u, opts) => {
+          const sent = JSON.parse(opts.body)
+          assert.equal(sent.model, m)
+          sentStream = sent.stream
+          const completed = {
+            type: "response.completed",
+            response: {
+              id: "resp_1",
+              output: [{ type: "message", content: [{ type: "output_text", text: "muse says hi" }] }],
+              usage: { input_tokens: 3, output_tokens: 4, total_tokens: 7 },
+            },
+          }
+          return new Response(`data: ${JSON.stringify(completed)}\n\n`, { status: 200, headers: { "content-type": "text/event-stream" } })
+        },
+      ],
+    ])
+    const req = mockReq({ _body: JSON.stringify({ model: m, messages: [{ role: "user", content: "hi" }] }) })
+    const res = mockRes()
+    await zp.handleChat(req, res)
+    assert.equal(sentStream, true)
+    const body = JSON.parse(res.body)
+    assert.equal(body.object, "chat.completion")
+    assert.equal(body.choices[0].message.content, "muse says hi")
+    assert.equal(body.model, m)
+    assert.equal(body.usage.total_tokens, 7)
+  })
+
+  test("when every model fails, the feed names the requested model and not the last one tried", async () => {
+    zp.saveConfig({ defaultModel: "big-pickle", autoSyncIntervalMs: 0, cacheMs: 0, retriesPerModel: 0, retryBackoffMs: 1, fallbackModels: ["big-pickle", "space-bunny-free"] })
+    const gated = () => jsonResponse({ type: "error", error: { type: "FreeTierError", message: "free tier can only be used within OpenCode" } }, 403)
+    globalThis.fetch = routeFetch([
+      ["/chat/completions", gated],
+      ["/responses", gated],
+    ])
+    const req = mockReq({ _body: JSON.stringify({ model: "big-pickle", messages: [] }) })
+    const res = mockRes()
+    await zp.handleChat(req, res)
+    assert.equal(res.state.status, 403)
+    assert.match(res.body, /FreeTierError/, "the requested model's error is surfaced")
+    const key = zp.requestStats.recent.at(-1)[0]
+    assert.ok(key.endsWith("|big-pickle|403"), `feed row must name the requested model only, got ${key}`)
+    assert.ok(!key.includes("→"), "no arrow: nothing served this request")
   })
 })
 
@@ -1687,6 +2094,7 @@ describe("handleApiConfig", () => {
   })
 
   test("PUT mid-stream abort: oversized body rejected before stream fully drained", async () => {
+    zp.saveConfig({ maxBodyBytes: 1024 * 1024 })
     const chunk = "x".repeat(100 * 1024)
     const chunks = Array.from({ length: 20 }, () => chunk) // ~2MB, no proxyKey set so adminAuth passes
     const req = mockStreamingReq(chunks, { method: "PUT" })
@@ -1821,15 +2229,21 @@ describe("shipped model catalog (models.json)", () => {
     assert.equal(typeof parsed.upstream, "string")
   })
 
-  test("shipped ids stay in the safe charset and split into chat and systemone", () => {
+  test("the shipped catalog stays chat-only while the classifier is still listed", async () => {
+    // models.json is read as the chat catalog by the model-sync Action and by the
+    // Claude Code picker generator, so a classifier must never appear in it. It is
+    // still callable and still listed on /v1/models, from the live catalog.
     const { models } = JSON.parse(fs.readFileSync(REPO_MODELS, "utf8"))
-    for (const id of models) assert.match(id, /^[A-Za-z0-9._:@+/%-]+$/)
-    assert.equal(new Set(models).size, models.length, "no duplicates")
     for (const id of models) {
-      assert.equal(zp.isSystemoneOnly(id), /^jev-/.test(id), `${id} is routed by its endpoint family`)
+      assert.match(id, /^[A-Za-z0-9._:@+/%-]+$/)
+      assert.equal(zp.isSystemoneOnly(id), false, `${id} is a chat model, so models.json may list it`)
     }
-    assert.ok(models.some((id) => /^jev-/.test(id)), "the free classifier is catalogued")
-    assert.ok(models.some((id) => !/^jev-/.test(id)), "chat models stay in the catalog")
+    assert.equal(new Set(models).size, models.length, "no duplicates")
+    assert.ok(zp.isSystemoneOnly("jev-1.13-free"), "the classifier belongs to the systemone family")
+    globalThis.fetch = async () => jsonResponse({ data: [{ id: "alpha-free" }, { id: "jev-1.13-free" }] })
+    zp.saveConfig({ fallbackModels: ["alpha-free"], modelAliases: {}, cacheMs: 0, defaultModel: "" })
+    const listed = await zp.fetchModels()
+    assert.deepEqual(listed.data.map((m) => m.id), ["alpha-free", "jev-1.13-free"])
   })
 
   test("a systemone model survives sync without being probed on chat", async () => {
@@ -2086,9 +2500,12 @@ describe("model-sync bot (scripts/sync-models.mjs)", () => {
     assert.deepEqual(r.catalog.models, ["alpha-free", "big-pickle"])
   })
 
-  test("lists jev-* (free, served on /v1/systemone rather than chat)", async () => {
+  test("never lists jev-* (served on /systemone, not chat)", async () => {
+    // models.json is the chat catalog: the picker generator and the proxy's chat
+    // chain both read it, and a classifier in it would be a chat model nobody can
+    // chat with. It is listed on /v1/models from the live catalog instead.
     const r = await runBot({ start: null, upstream: ["alpha-free", "jev-1.13-free", "jev-9-free"] })
-    assert.deepEqual(r.catalog.models, ["alpha-free", "jev-1.13-free", "jev-9-free"])
+    assert.deepEqual(r.catalog.models, ["alpha-free"])
   })
 
   test("keeps only ids inside the safe charset", async () => {
@@ -2231,6 +2648,110 @@ describe("Anthropic Messages API layer", () => {
     assert.equal(user.content[0].image_url.url, "data:image/png;base64,AAAA")
   })
 
+  test("images inside a tool_result follow as a user turn (Claude Code Read)", () => {
+    // Claude Code delivers every image it reads as an image block inside the
+    // tool_result — it used to be dropped, so the model never saw the picture.
+    const out = zp.anthropicToChatBody(
+      {
+        messages: [
+          { role: "user", content: "read it" },
+          { role: "assistant", content: [{ type: "tool_use", id: "t1", name: "Read", input: { file_path: "/p.png" } }] },
+          {
+            role: "user",
+            content: [
+              {
+                type: "tool_result",
+                tool_use_id: "t1",
+                content: [
+                  { type: "image", source: { type: "base64", media_type: "image/png", data: "IMG" } },
+                  { type: "text", text: "screenshot attached" },
+                ],
+              },
+            ],
+          },
+        ],
+      },
+      "m",
+    )
+    const tool = out.messages.find((m) => m.role === "tool")
+    assert.equal(tool.tool_call_id, "t1")
+    assert.equal(tool.content, "screenshot attached", "text stays on the tool message")
+    const imgTurn = out.messages.find((m) => m.role === "user" && Array.isArray(m.content) && m.content.some((p) => p?.type === "image_url"))
+    assert.equal(imgTurn.content[0].image_url.url, "data:image/png;base64,IMG")
+    assert.ok(out.messages.indexOf(tool) < out.messages.indexOf(imgTurn), "image follows the tool output")
+  })
+
+  test("image-only tool_result keeps the tool round-trip and attaches the picture", () => {
+    const out = zp.anthropicToChatBody(
+      {
+        messages: [
+          { role: "assistant", content: [{ type: "tool_use", id: "t2", name: "Read", input: {} }] },
+          { role: "user", content: [{ type: "tool_result", tool_use_id: "t2", content: [{ type: "image", source: { type: "base64", media_type: "image/jpeg", data: "JPG" } }] }] },
+        ],
+      },
+      "m",
+    )
+    const tool = out.messages.find((m) => m.role === "tool")
+    assert.equal(tool.tool_call_id, "t2")
+    const imgTurn = out.messages.find((m) => m.role === "user" && Array.isArray(m.content) && m.content.some((p) => p?.type === "image_url"))
+    assert.equal(imgTurn.content[0].image_url.url, "data:image/jpeg;base64,JPG")
+  })
+
+  test("string tool_result content is untouched", () => {
+    const out = zp.anthropicToChatBody(
+      { messages: [{ role: "user", content: [{ type: "tool_result", tool_use_id: "t3", content: "plain text" }] }] },
+      "m",
+    )
+    assert.equal(out.messages.find((m) => m.role === "tool").content, "plain text")
+    assert.ok(!out.messages.some((m) => Array.isArray(m.content) && m.content.some((p) => p?.type === "image_url")))
+  })
+
+  test("the chosen model is retried before /v1/messages falls back", async () => {
+    zp.saveConfig({ defaultModel: "", autoSyncIntervalMs: 0, cacheMs: 0, retriesPerModel: 2, retryBackoffMs: 1, fallbackModels: ["big-pickle", "space-bunny-free"] })
+    const calls = []
+    globalThis.fetch = routeFetch([
+      [
+        "/chat/completions",
+        (u, opts) => {
+          const sent = JSON.parse(opts.body)
+          calls.push(sent.model)
+          if (calls.length === 1) return jsonResponse({ error: { type: "server_error", message: "hiccup" } }, 502)
+          return jsonResponse({ model: sent.model, choices: [{ finish_reason: "stop", message: { role: "assistant", content: "hi" } }] })
+        },
+      ],
+    ])
+    const { status, body } = await callRoute(req({ model: "big-pickle", max_tokens: 16, messages: [{ role: "user", content: "hi" }] }))
+    assert.equal(status, 200)
+    assert.deepEqual(calls, ["big-pickle", "big-pickle"], "retried in place, no fallback")
+    assert.equal(body.model, "big-pickle")
+    assert.equal(body.zen_served_by, undefined)
+  })
+
+  test("streaming fallback exposes the serving model in headers", async () => {
+    zp.saveConfig({ defaultModel: "", autoSyncIntervalMs: 0, cacheMs: 0, retriesPerModel: 0, fallbackModels: ["big-pickle", "space-bunny-free"] })
+    globalThis.fetch = routeFetch([
+      [
+        "/chat/completions",
+        (u, opts) => {
+          const sent = JSON.parse(opts.body)
+          if (sent.model === "big-pickle") {
+            return jsonResponse({ type: "error", error: { type: "FreeTierError", message: "free tier can only be used within OpenCode" } }, 403)
+          }
+          return sseResponse(["hel", "lo"], "upstream-model")
+        },
+      ],
+    ])
+    const r = req({ model: "big-pickle", stream: true, max_tokens: 16, messages: [{ role: "user", content: "hi" }] })
+    const res = mockRes()
+    await zp.router(r, res)
+    await res.done
+    assert.equal(res.state.status, 200)
+    assert.equal(res.state.headers["x-zen-served-by"], "space-bunny-free")
+    assert.equal(res.state.headers["x-zen-fallback"], "true")
+    assert.match(res.body, /event: message_start/)
+    assert.match(res.body, /"model":"big-pickle"/, "client's model name preserved in the stream")
+  })
+
   test("opencode bridge tools are added only for tools the caller actually has", () => {
     // The free tier only accepts a request carrying opencode's own tool manifest.
     // Offering one the caller lacks would produce a tool call it cannot run.
@@ -2344,6 +2865,101 @@ describe("opencode tool bridge", () => {
     const msg = zp.chatToAnthropic({ choices: [{ finish_reason: "tool_calls", message: { tool_calls: [{ id: "t1", function: { name: "TodoWrite", arguments: '{"x":1}' } }] } }] }, "m")
     assert.equal(msg.content[0].name, "TodoWrite")
     assert.deepEqual(msg.content[0].input, { x: 1 })
+  })
+})
+
+describe("bridge tools on the Anthropic path", () => {
+  const bridgeCfg = (m) => zp.saveConfig({ defaultModel: m, fallbackModels: [m], retriesPerModel: 0, retryBackoffMs: 1, autoSyncIntervalMs: 0, cacheMs: 0, agentTools: true })
+  const carriesRead = (sent) => (sent.tools ?? []).some((t) => (t.function?.name ?? t.name) === "read")
+  const toolCallSse = () =>
+    new Response(
+      [
+        { model: "up", choices: [{ delta: { tool_calls: [{ index: 0, id: "c1", type: "function", function: { name: "read", arguments: '{"filePath":"/etc/hostname"}' } }] } }] },
+        { model: "up", choices: [{ delta: {}, finish_reason: "tool_calls" }] },
+      ]
+        .map((b) => `data: ${JSON.stringify(b)}\n\n`)
+        .join("") + "data: [DONE]\n\n",
+      { status: 200, headers: { "content-type": "text/event-stream" } },
+    )
+
+  test("a tool-less /v1/messages request carries the whole manifest, pinned off", async () => {
+    const m = "space-bunny-free"
+    bridgeCfg(m)
+    let sent = null
+    globalThis.fetch = routeFetch([
+      [
+        "/chat/completions",
+        (u, opts) => {
+          sent = JSON.parse(opts.body)
+          if (!carriesRead(sent)) return jsonResponse({ type: "error", error: { type: "FreeTierError", message: "free tier" } }, 403)
+          return sseResponse(["ok"], "up")
+        },
+      ],
+    ])
+    const req = mockReq({ url: "/v1/messages", _body: JSON.stringify({ model: m, max_tokens: 16, messages: [{ role: "user", content: "title this" }] }) })
+    const res = mockRes()
+    await zp.handleMessages(req, res)
+    assert.equal(res.state.status, 200, "the gate takes the bridged manifest")
+    assert.deepEqual(
+      sent.tools.map((t) => t.function.name),
+      zp.loadAgentTools().map((t) => t.function.name),
+    )
+    assert.equal(sent.tool_choice, "none", "the model must not call a tool the caller never offered")
+    assert.equal(sent.stream, true)
+  })
+
+  test("a tool-less streaming reply must not leak a bridge tool call", async () => {
+    const m = "space-bunny-free"
+    bridgeCfg(m)
+    globalThis.fetch = routeFetch([["/chat/completions", () => toolCallSse()]])
+    const req = mockReq({ url: "/v1/messages", _body: JSON.stringify({ model: m, max_tokens: 16, stream: true, messages: [{ role: "user", content: "summarize" }] }) })
+    const res = mockRes()
+    await zp.handleMessages(req, res)
+    await res.done
+    assert.equal(res.state.status, 200)
+    assert.ok(!res.body.includes("tool_use"), `a bridge tool call reached the caller: ${res.body}`)
+    assert.match(res.body, /"stop_reason":"end_turn"/)
+  })
+
+  test("a tool-less non-streaming reply loses its bridge tool call too", async () => {
+    const m = "space-bunny-free"
+    bridgeCfg(m)
+    globalThis.fetch = routeFetch([["/chat/completions", () => toolCallSse()]])
+    const req = mockReq({ url: "/v1/messages", _body: JSON.stringify({ model: m, max_tokens: 16, messages: [{ role: "user", content: "summarize" }] }) })
+    const res = mockRes()
+    await zp.handleMessages(req, res)
+    const body = JSON.parse(res.body)
+    assert.ok(!body.content.some((b) => b.type === "tool_use"), "the bridge call is gone")
+    assert.equal(body.stop_reason, "end_turn")
+  })
+
+  test("an agent /v1/messages request keeps its tools and no pin", async () => {
+    const m = "space-bunny-free"
+    bridgeCfg(m)
+    let sent = null
+    globalThis.fetch = routeFetch([
+      [
+        "/chat/completions",
+        (u, opts) => {
+          sent = JSON.parse(opts.body)
+          return sseResponse(["ok"], "up")
+        },
+      ],
+    ])
+    const req = mockReq({
+      url: "/v1/messages",
+      _body: JSON.stringify({
+        model: m,
+        max_tokens: 16,
+        messages: [{ role: "user", content: "hi" }],
+        tools: [{ name: "Read", description: "r", input_schema: { type: "object", properties: {} } }],
+      }),
+    })
+    const res = mockRes()
+    await zp.handleMessages(req, res)
+    const names = sent.tools.map((t) => t.function.name)
+    assert.ok(names.includes("read") && names.includes("Read"), `the bridge plus the caller's tool, got ${names}`)
+    assert.equal(sent.tool_choice, undefined, "an agent turn stays free to call tools")
   })
 })
 

@@ -60,7 +60,6 @@ const BAKED_MODELS = [
   "cat-jam-free",
   "deepseek-v4.1-flash-free",
   "nemotron-3.5-super-vl-free",
-  "jev-1.13-free",
 ]
 function loadShippedModels() {
   try {
@@ -183,6 +182,13 @@ function remapAgentTool(name, rawArgs) {
   return { name: spec.name, args: JSON.stringify(out) }
 }
 
+// Request bodies get big in real sessions: Claude Code's compaction POSTs the
+// whole transcript (base64 images included) and upstream itself accepted a 30MB
+// probe untouched. The old 1MB ceiling turned those requests into 413s, which
+// Claude Code surfaces as "request size limit reached" and abandons the session.
+// The default mirrors Anthropic's own 32MB guidance; `maxBodyBytes` overrides it.
+const MAX_BODY = 32 * 1024 * 1024
+
 const DEFAULT_CONFIG = {
   host: ENV.HOST ?? "127.0.0.1",
   port: Number(ENV.PORT ?? 8787),
@@ -221,6 +227,11 @@ const DEFAULT_CONFIG = {
     ENV.RESPONSES_MODELS ??
       JSON.stringify(["gpt-5*", "gpt-6*", "grok-*", "muse-spark-*"]),
   ),
+  maxBodyBytes: Number(ENV.MAX_BODY_BYTES ?? MAX_BODY),
+  // How many extra attempts a request gets against the *same* model when it
+  // fails transiently (429/5xx/network) before the fallback chain moves on.
+  retriesPerModel: Number(ENV.RETRIES_PER_MODEL ?? 2),
+  retryBackoffMs: Number(ENV.RETRY_BACKOFF_MS ?? 500),
   rateLimitMax: Number(ENV.RATE_LIMIT_MAX ?? 0),
   rateLimitWindowMs: Number(ENV.RATE_LIMIT_WINDOW_MS ?? 60_000),
   proxyKey: ENV.PROXY_KEY ?? "",
@@ -362,7 +373,6 @@ function sanitize(cfg) {
 }
 
 const ALLOWED = () => new Set([...config.fallbackModels, ...Object.values(config.modelAliases)])
-const MAX_BODY = 8 * 1024 * 1024
 const requestStats = { total: 0, errors: 0, recent: [], perMinute: new Map(), window60: [] }
 // jev-* free models are served on /v1/systemone (structured classification),
 // which has a different request and reply shape from chat/responses. They are
@@ -447,11 +457,25 @@ const RETRYABLE_ERROR_TYPES = new Set([
 // still break out immediately.
 function retryableUpstream(status, body) {
   if (status === 429 || status >= 500) return true
+  // 410 Gone is what a retired model id returns; auto-sync may not have caught
+  // up yet, so the chain has to keep walking instead of surfacing "deprecated".
+  if (status === 410) return true
   if (status < 400 || status > 499) return false
   const t = body?.error?.type ?? body?.type ?? ""
   const msg = String(body?.error?.message ?? body?.message ?? "")
   if (RETRYABLE_ERROR_TYPES.has(t)) return true
-  return /model is unavailable|not supported|only be used in opencode|free tier can only|no such model|does not exist|overloaded|temporarily.*limit|upstream request failed/i.test(msg)
+  return /model is unavailable|not supported|only be used in opencode|free tier can only|no such model|does not exist|has been deprecated|no longer available|overloaded|temporarily.*limit|upstream request failed/i.test(msg)
+}
+
+// Transient means waiting and asking the *same* model again can plausibly
+// succeed (provider hiccup, rate limit, network blip). Model-level verdicts —
+// free-tier gate 403s, geo blocks, retired ids — are deterministic, so those
+// skip straight to the next candidate rather than burning retries on a
+// foregone conclusion.
+function transientUpstream(status, body) {
+  if (status === 429 || status >= 500) return true
+  const t = body?.error?.type ?? body?.type ?? ""
+  return t === "server_error" || t === "api_error" || t === "upstream_error" || t === "ProviderError"
 }
 
 // ---- endpoint family resolution -------------------------------------------
@@ -544,11 +568,21 @@ function anthropicToChatMessages(system, messages) {
         })
       } else if (type === "tool_result") {
         flush()
+        // A tool result may carry images: Claude Code's Read on a picture sends
+        // an image block inside the tool_result, and nothing else. Chat
+        // endpoints reject images in role "tool", so the text stays on the tool
+        // message and the pictures follow as a user turn — the same shape the
+        // Responses translation already uses. Without this the model only saw
+        // an empty text fallback and the picture silently vanished.
+        const images = Array.isArray(b.content)
+          ? b.content.filter((p) => p?.type === "image").map(anthropicImageUrl).filter(Boolean)
+          : []
         out.push({
           role: "tool",
           tool_call_id: b.tool_use_id ?? b.id ?? "call_0",
           content: typeof b.content === "string" ? b.content : textOf(b.content) || " ",
         })
+        if (images.length) out.push({ role: "user", content: images.map((url) => ({ type: "image_url", image_url: { url } })) })
       }
     }
     flush()
@@ -849,9 +883,9 @@ function num(v, dflt) {
   return Number.isFinite(n) ? n : dflt
 }
 const syncState = { at: 0, ok: false, running: false, working: [], rateLimited: [], flaky: [], gated: [], dead: [], systemone: [], error: "", ms: 0 }
-// Health learned from real client traffic. The free tier rejects our synthetic
-// health probe (it only accepts genuine agent-shaped requests), so real traffic
-// is the only trustworthy signal that a model is actually serving.
+// Health learned from real client traffic, kept alongside the agent-shaped
+// probe in probeModel(). Real traffic is the ground truth: it can disagree
+// with a probe when a gate lifts or a quota refills mid-cycle.
 const observed = new Map()
 function recordObserved(model, ok) {
   if (!model) return
@@ -1113,7 +1147,14 @@ function authForUpstream(req) {
   return upstreamAuths(req).auths[0] ?? null
 }
 
-async function readBody(req, limit = MAX_BODY) {
+// The configured ceiling wins when it is a positive number; 0/absent keeps the
+// shipped default (see MAX_BODY).
+function maxBodyBytes() {
+  const n = Number(config.maxBodyBytes)
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : MAX_BODY
+}
+
+async function readBody(req, limit = maxBodyBytes()) {
   let raw = ""
   for await (const chunk of req) {
     raw += chunk
@@ -1139,15 +1180,6 @@ function json(res, status, data) {
 // prepended to the client's system prompt.
 
 
-// Anthropic clients authenticate with `x-api-key`; the OpenAI-compatible SDKs
-// use `Authorization: Bearer`. Accept either so Claude Code and curl both work.
-function bearerOrKey(req) {
-  const v = req.headers["authorization"]
-  if (typeof v === "string" && v.startsWith("Bearer ")) return v.slice(7).trim()
-  const k = req.headers["x-api-key"]
-  if (typeof k === "string" && k.trim()) return k.trim()
-  return ""
-}
 
 async function handleMessages(req, res) {
   const start = Date.now()
@@ -1196,17 +1228,39 @@ async function handleMessages(req, res) {
     if (!auths.includes(first)) auths.unshift(first)
   }
   if (!auths.includes("Bearer public")) auths.push("Bearer public")
+  let auth = auths[0]
+  let ai = 0
 
   let lastErr = null
   let lastStatus = 502
+  let firstErr = null
+  let firstStatus = 0
   let used = requested
+  // The model the client chose is tried first; transient failures are retried
+  // against that same model before the chain moves on.
+  const retries = config.retriesPerModel > 0 ? Math.floor(config.retriesPerModel) : 0
+  // Same bridge rule as the chat path: a caller that sends no tools (title-gen
+  // helper calls, plain API use) gets opencode's whole manifest pinned off, or
+  // the gate answers 403 for every model and the request walks the chain.
+  const bridge = (body?.tools ?? []).length ? [] : gateBridgeTools()
+  const bridged = bridge.length > 0
   for (const model of candidates) {
+    const chosen = model === candidates[0]
     used = model
     const format = modelFormat(model)
-    const payload = format === "responses" ? responsesRequest(anthropicToChatBody(body, model), model, isStream) : anthropicToChatBody(body, model)
-    let nextModel = false
-    for (let ai = 0; ai < auths.length; ai++) {
-      const auth = auths[ai]
+    // Upstream only ever sees streams (see collectChatCompletion); whether the
+    // client asked for one decides how the reply is shaped, not what is sent.
+    const payload = format === "responses" ? responsesRequest(anthropicToChatBody(body, model), model, true) : { ...anthropicToChatBody(body, model), stream: true }
+    if (bridged) {
+      payload.tools = format === "responses" ? chatToolsToResponses(bridge) : bridge
+      // /responses takes only "auto"; the chat endpoint takes the pin.
+      if (format === "responses") delete payload.tool_choice
+      else payload.tool_choice = "none"
+    }
+    let delayMs = 0
+    for (let attempt = 0; attempt <= retries; attempt++) {
+      if (delayMs > 0) await new Promise((r) => setTimeout(r, delayMs))
+      delayMs = 0
       let upstreamRes
       try {
         upstreamRes = await fetch(`${config.upstream}${format === "responses" ? "/responses" : "/chat/completions"}`, {
@@ -1218,15 +1272,28 @@ async function handleMessages(req, res) {
       } catch (err) {
         lastErr = { error: { type: "api_error", message: err.message } }
         lastStatus = 502
-        nextModel = true
+        if (attempt < retries) {
+          delayMs = config.retryBackoffMs * (attempt + 1)
+          continue
+        }
+        recordObserved(model, false)
         break
       }
+
       noteKeyUsed(auth, upstreamRes.status)
+      // A rejected account is swapped before the model is abandoned (same rule as
+      // the chat path), and the chain bounds how often that can happen.
+      if (keyRotationWorthy(upstreamRes.status, null) && ai + 1 < auths.length) {
+        log(`${keyLabel(auth)} rejected (${upstreamRes.status}) — retrying ${model} on the next account`)
+        auth = auths[++ai]
+        attempt--
+        continue
+      }
 
       if (upstreamRes.ok) {
         if (isStream) {
           const chunks = format === "responses" ? responsesChunksAsChat(upstreamRes) : sseChunks(upstreamRes)
-          relayAnthropicStream(req, res, chunks, requested, model)
+          relayAnthropicStream(req, res, chunks, requested, model, bridged)
           res.on("finish", () => {
             recordReq(req, `${requested}→${model}`, Date.now() - start, 200)
             recordObserved(model, true)
@@ -1234,10 +1301,14 @@ async function handleMessages(req, res) {
           return
         }
         try {
-          const content = await upstreamRes.json()
-          const shaped = format === "responses" ? responsesToChat(content, requested, model) : content
+          const content = format === "responses" ? await collectResponses(upstreamRes) : await collectChatCompletion(upstreamRes)
+          const shaped = stripToolCalls(format === "responses" ? responsesToChat(content, requested, model) : content, bridged)
           recordReq(req, `${requested}→${model}`, Date.now() - start, 200)
           recordObserved(model, true)
+          if (model !== requested) {
+            res.setHeader?.("x-zen-served-by", model)
+            res.setHeader?.("x-zen-fallback", "true")
+          }
           return json(res, 200, chatToAnthropic(shaped, requested, model))
         } catch {
           recordReq(req, requested, Date.now() - start, 502)
@@ -1251,24 +1322,37 @@ async function handleMessages(req, res) {
         lastErr = { error: { type: "api_error", message: `upstream returned ${upstreamRes.status}` } }
       }
       lastStatus = upstreamRes.status
-      if (keyRotationWorthy(upstreamRes.status, lastErr) && ai + 1 < auths.length) {
-        log(`${keyLabel(auth)} rejected (${upstreamRes.status}) — retrying ${model} on the next account`)
+      const retryAfterMs = Math.min(parseRetryAfter(upstreamRes.headers.get("retry-after")) * 1000, 3000)
+      if (transientUpstream(upstreamRes.status, lastErr) && attempt < retries) {
+        delayMs = Math.max(config.retryBackoffMs * (attempt + 1), retryAfterMs)
         continue
       }
       recordObserved(model, false)
-      nextModel = retryableUpstream(upstreamRes.status, lastErr)
-      if (nextModel) {
-        const wait = Math.min(parseRetryAfter(upstreamRes.headers.get("retry-after")) * 1000, 3000)
-        if (wait > 0) await new Promise((r) => setTimeout(r, wait))
+      if (retryableUpstream(upstreamRes.status, lastErr)) {
+        if (retryAfterMs > 0) await new Promise((r) => setTimeout(r, retryAfterMs))
+        break
       }
-      break
+      // A deterministic client-visible error (bad request, auth, …): report it
+      // as-is rather than masking it with the rest of the chain.
+      recordReq(req, `${requested}→${used}`, Date.now() - start, lastStatus)
+      const e = anthropicError(lastStatus, lastErr)
+      res.writeHead(e.status, { "content-type": "application/json" })
+      res.end(JSON.stringify(e.body))
+      return
     }
-    if (nextModel) continue
-    break
+    if (chosen && firstErr == null) {
+      firstErr = lastErr
+      firstStatus = lastStatus
+    }
   }
 
-  recordReq(req, `${requested}→${used}`, Date.now() - start, lastStatus)
-  const e = anthropicError(lastStatus, lastErr ?? { error: { type: "api_error", message: "all free models are unavailable" } })
+  // Every candidate failed. Surface the error from the model the client asked
+  // for — the tail of the chain is an implementation detail and used to leak
+  // unrelated failures (e.g. a retired model's 410 "deprecated").
+  const finalErr = firstErr ?? lastErr
+  const finalStatus = firstErr ? firstStatus : lastStatus
+  recordReq(req, requested, Date.now() - start, finalStatus)
+  const e = anthropicError(finalStatus, finalErr ?? { error: { type: "api_error", message: "all free models are unavailable" } })
   res.writeHead(e.status, { "content-type": "application/json" })
   res.end(JSON.stringify(e.body))
 }
@@ -1306,17 +1390,27 @@ async function handleChat(req, res) {
     return json(res, 401, { error: { type: "invalid_request_error", message: "invalid proxy key" } })
   }
   const auths = plan.auths.length ? plan.auths : ["Bearer public"]
+  let auth = auths[0]
+  let ai = 0
 
   let lastErr = null
   let lastStatus = 502
+  let firstErr = null
+  let firstStatus = 0
   let used = requested
+  // The model the client chose is tried first; transient failures are retried
+  // against that same model before the chain moves on.
+  const retries = config.retriesPerModel > 0 ? Math.floor(config.retriesPerModel) : 0
   const bridge = body.tools?.length ? [] : gateBridgeTools()
-    const bridged = bridge.length > 0
+  const bridged = bridge.length > 0
   for (const model of candidates) {
+    const chosen = model === candidates[0]
     used = model
     const format = modelFormat(model)
+    // Streams upstream regardless of what the client asked for — see
+    // collectChatCompletion — and the collector puts the shape back.
     const payload =
-      format === "responses" ? responsesRequest(body, model, isStream) : { ...body, model }
+      format === "responses" ? responsesRequest(body, model, true) : { ...body, model, stream: true }
     if (bridged) {
       payload.tools = format === "responses" ? chatToolsToResponses(bridge) : bridge
       // The gateway takes only "auto" on /responses, so forwarding anything the
@@ -1324,9 +1418,10 @@ async function handleChat(req, res) {
       if (format === "responses") delete payload.tool_choice
       else payload.tool_choice = "none"
     }
-    let nextModel = false
-    for (let ai = 0; ai < auths.length; ai++) {
-      const auth = auths[ai]
+    let delayMs = 0
+    for (let attempt = 0; attempt <= retries; attempt++) {
+      if (delayMs > 0) await new Promise((r) => setTimeout(r, delayMs))
+      delayMs = 0
       let upstreamRes
       try {
         upstreamRes = await fetch(`${config.upstream}${format === "responses" ? "/responses" : "/chat/completions"}`, {
@@ -1338,13 +1433,31 @@ async function handleChat(req, res) {
       } catch (err) {
         lastErr = { error: { type: "upstream_error", message: err.message } }
         lastStatus = 502
-        nextModel = true
+        if (attempt < retries) {
+          delayMs = config.retryBackoffMs * (attempt + 1)
+          continue
+        }
+        recordObserved(model, false)
         break
       }
+
       noteKeyUsed(auth, upstreamRes.status)
+      // A rejected account is swapped before the model is abandoned: the model is
+      // fine, this credential is not. Each swap advances the chain, so the loop
+      // is bounded by the number of accounts.
+      if (keyRotationWorthy(upstreamRes.status, null) && ai + 1 < auths.length) {
+        log(`${keyLabel(auth)} rejected (${upstreamRes.status}) — retrying ${model} on the next account`)
+        auth = auths[++ai]
+        attempt--
+        continue
+      }
 
       if (upstreamRes.ok) {
         if (isStream) {
+          if (model !== requested) {
+            res.setHeader?.("x-zen-served-by", model)
+            res.setHeader?.("x-zen-fallback", "true")
+          }
           if (format === "responses") {
             relayResponsesStream(req, res, upstreamRes, requested, bridged)
           } else {
@@ -1354,10 +1467,14 @@ async function handleChat(req, res) {
           return
         }
         try {
-          const content = await upstreamRes.json()
+          const content = format === "responses" ? await collectResponses(upstreamRes) : await collectChatCompletion(upstreamRes)
           if (format === "responses") {
             recordReq(req, `${requested}→${model}`, Date.now() - start, 200)
             recordObserved(model, true)
+            if (model !== requested) {
+              res.setHeader?.("x-zen-served-by", model)
+              res.setHeader?.("x-zen-fallback", "true")
+            }
             return json(res, 200, stripToolCalls(responsesToChat(content, requested, model), bridged))
           }
           if (model !== requested) {
@@ -1385,32 +1502,45 @@ async function handleChat(req, res) {
         lastErr = { error: { type: "upstream_error", message: `upstream returned ${upstreamRes.status}` } }
       }
       lastStatus = upstreamRes.status
-      // A rejected account is swapped before the model is abandoned: the model
-      // is fine, this credential is not.
-      if (keyRotationWorthy(upstreamRes.status, lastErr) && ai + 1 < auths.length) {
-        log(`${keyLabel(auth)} rejected (${upstreamRes.status}) — retrying ${model} on the next account`)
+      const retryAfterMs = Math.min(parseRetryAfter(upstreamRes.headers.get("retry-after")) * 1000, 3000)
+      if (transientUpstream(upstreamRes.status, lastErr) && attempt < retries) {
+        delayMs = Math.max(config.retryBackoffMs * (attempt + 1), retryAfterMs)
         continue
       }
       // Try the next candidate not only on 429/5xx but also when the upstream
       // reports a model/environment-level failure (e.g. a provider that is
-      // temporarily "unavailable", a geo-blocked free model, or a stale model id)
-      // so one dead model doesn't brick the whole request.
+      // temporarily "unavailable", a geo-blocked free model, or a stale model
+      // id) so one dead model doesn't brick the whole request.
       recordObserved(model, false)
-      nextModel = retryableUpstream(upstreamRes.status, lastErr)
-      if (nextModel) {
-        const wait = Math.min(parseRetryAfter(upstreamRes.headers.get("retry-after")) * 1000, 3000)
-        if (wait > 0) await new Promise((r) => setTimeout(r, wait))
+      if (retryableUpstream(upstreamRes.status, lastErr)) {
+        if (retryAfterMs > 0) await new Promise((r) => setTimeout(r, retryAfterMs))
+        break
       }
-      break
+      // A deterministic client-visible error (bad request, auth, …): report it
+      // as-is rather than masking it with the rest of the chain.
+      recordReq(req, `${requested}→${used}`, Date.now() - start, lastStatus)
+      res.writeHead(lastStatus, { "content-type": "application/json" })
+      res.end(JSON.stringify(lastErr))
+      return
     }
-    if (nextModel) continue
-    break
+    if (chosen && firstErr == null) {
+      firstErr = lastErr
+      firstStatus = lastStatus
+    }
   }
 
-  recordReq(req, `${requested}→${used}`, Date.now() - start, lastStatus)
-  res.writeHead(lastStatus, { "content-type": "application/json" })
+  // Every candidate failed. Surface the error from the model the client asked
+  // for — the tail of the chain is an implementation detail and used to leak
+  // unrelated failures (e.g. a retired model's 410 "deprecated").
+  const finalStatus = firstErr ? firstStatus : lastStatus
+  const finalErr = firstErr ?? lastErr
+  // Nothing served this request, so the feed names no server — the last model
+  // tried is an implementation detail and used to read as "another model
+  // answered" while the error shown actually came from the requested one.
+  recordReq(req, requested, Date.now() - start, finalStatus)
+  res.writeHead(finalStatus, { "content-type": "application/json" })
   res.end(
-    JSON.stringify(lastErr ?? { error: { type: "free_usage_limit_error", message: "all free models are rate-limited" } }),
+    JSON.stringify(finalErr ?? { error: { type: "free_usage_limit_error", message: "all free models are rate-limited" } }),
   )
 }
 
@@ -1437,6 +1567,84 @@ async function* sseChunks(upstreamRes) {
       reader.cancel()
     } catch {}
   }
+}
+
+// The free-tier gate only answers streaming traffic: a non-streaming request is
+// refused with 403 FreeTierError for every model, no matter which one is asked.
+// That used to walk the whole fallback chain (~5s), mark every model as failed
+// on the dashboard and return a 403 that read like a different model had been
+// used. So a non-streaming client request is sent upstream as a stream and the
+// SSE is re-assembled into the plain JSON the client asked for.
+async function collectChatCompletion(upstreamRes) {
+  if (!/text\/event-stream/i.test(upstreamRes.headers.get("content-type") ?? "")) return upstreamRes.json()
+  const message = { role: "assistant", content: "" }
+  const out = {
+    id: `chatcmpl-${randomBytes(12).toString("hex")}`,
+    object: "chat.completion",
+    created: Math.floor(Date.now() / 1000),
+    model: "",
+    choices: [{ index: 0, message, finish_reason: "stop" }],
+  }
+  const toolCalls = []
+  for await (const block of sseChunks(upstreamRes)) {
+    let raw = ""
+    for (const line of block.split("\n")) if (line.startsWith("data:")) raw = line.slice(5).trim()
+    if (!raw || raw === "[DONE]") continue
+    let d
+    try {
+      d = JSON.parse(raw)
+    } catch {
+      continue
+    }
+    if (d?.error) throw new Error(d.error.message ?? "upstream stream error")
+    if (d?.id) out.id = d.id
+    if (d?.model) out.model = d.model
+    if (d?.created) out.created = d.created
+    if (d?.usage) out.usage = d.usage
+    const choice = d?.choices?.[0]
+    if (!choice) continue
+    const delta = choice.delta ?? {}
+    if (typeof delta.content === "string" && delta.content) message.content += delta.content
+    if (typeof delta.reasoning_content === "string" && delta.reasoning_content)
+      message.reasoning_content = (message.reasoning_content ?? "") + delta.reasoning_content
+    for (const tc of delta.tool_calls ?? []) {
+      const idx = tc.index ?? 0
+      const cur = toolCalls[idx] ?? (toolCalls[idx] = { id: tc.id ?? `call_${idx}`, type: "function", function: { name: "", arguments: "" } })
+      if (tc.id) cur.id = tc.id
+      if (tc.function?.name) cur.function.name = tc.function.name
+      if (tc.function?.arguments) cur.function.arguments += tc.function.arguments
+    }
+    if (choice.finish_reason) out.choices[0].finish_reason = choice.finish_reason
+  }
+  const calls = toolCalls.filter(Boolean)
+  if (calls.length) {
+    message.tool_calls = calls
+    if (out.choices[0].finish_reason === "stop") out.choices[0].finish_reason = "tool_calls"
+  }
+  return out
+}
+
+// Same idea for /responses: the finished response object arrives whole in the
+// `response.completed` event, which is exactly what responsesToChat expects.
+async function collectResponses(upstreamRes) {
+  if (!/text\/event-stream/i.test(upstreamRes.headers.get("content-type") ?? "")) return upstreamRes.json()
+  let result = null
+  for await (const block of sseChunks(upstreamRes)) {
+    let raw = ""
+    for (const line of block.split("\n")) if (line.startsWith("data:")) raw = line.slice(5).trim()
+    if (!raw || raw === "[DONE]") continue
+    let d
+    try {
+      d = JSON.parse(raw)
+    } catch {
+      continue
+    }
+    if (d?.error) throw new Error(d.error.message ?? "upstream stream error")
+    if (d?.type === "response.completed" || d?.type === "response.incomplete") result = d.response ?? result
+    else if (d?.response?.output) result = d.response
+  }
+  if (!result) throw new Error("stream ended without a completed response")
+  return result
 }
 
 // Responses SSE -> chat-shaped SSE text blocks, so the Anthropic translator
@@ -1485,11 +1693,14 @@ async function* responsesChunksAsChat(upstreamRes) {
 // then message_delta carrying stop_reason and usage, then message_stop. Tool
 // arguments arrive as input_json_delta, so they are buffered until the block ends
 // rather than being re-parsed per chunk.
-function relayAnthropicStream(req, res, chunks, requested, servedBy) {
+function relayAnthropicStream(req, res, chunks, requested, servedBy, strip = false) {
   res.writeHead(200, {
     "content-type": "text/event-stream",
     "cache-control": "no-cache",
     connection: "keep-alive",
+    // Streaming responses get no JSON body a client could inspect, so the
+    // serving model is exposed as headers instead.
+    ...(servedBy && servedBy !== requested ? { "x-zen-served-by": servedBy, "x-zen-fallback": "true" } : {}),
   })
   const id = `msg_${randomBytes(12).toString("hex")}`
   const emit = (type, data) => res.write(`event: ${type}\ndata: ${JSON.stringify({ type, ...data })}\n\n`)
@@ -1548,7 +1759,9 @@ function relayAnthropicStream(req, res, chunks, requested, servedBy) {
             if (d.usage) st.usage = d.usage
             const choice = d.choices?.[0]
             const delta = choice?.delta ?? {}
-            if (choice?.finish_reason) st.finish = choice.finish_reason
+            // The bridge tools exist only to satisfy the gate; a caller that
+            // offered none must never see a call to one (see stripToolCalls).
+            if (choice?.finish_reason) st.finish = strip && choice.finish_reason === "tool_calls" ? "stop" : choice.finish_reason
             if (typeof delta.content === "string" && delta.content) {
               closeThink()
               if (!st.textOpen) {
@@ -1564,7 +1777,7 @@ function relayAnthropicStream(req, res, chunks, requested, servedBy) {
               }
               emit("content_block_delta", { index: 0, delta: { type: "thinking_delta", thinking: delta.reasoning_content } })
             }
-            for (const tc of delta.tool_calls ?? []) {
+            for (const tc of strip ? [] : delta.tool_calls ?? []) {
               closeThink()
               closeText()
               const tIndex = tc.index ?? 0
@@ -1710,27 +1923,57 @@ function probeAuthHeader() {
   return "Bearer public"
 }
 
+// Health probes have to look like agent traffic or the free-tier gate refuses
+// them with FreeTierError before a model is ever reached: opencode's own tool
+// manifest plus `stream: true` is what a real client sends, so the probe sends
+// exactly that. Without it every model used to land in the "gate-blocked"
+// bucket, which told the user nothing about whether it actually works.
+function agentProbePayload(id, format) {
+  // A classifier is not a chat model: it takes a state and typed questions, so a
+  // chat-shaped probe would only ever come back as a shape error.
+  if (format === "systemone") {
+    return { model: id, state: "ping", questions: { ping: { type: "noul", instructions: "Is this request a liveness check?" } } }
+  }
+  const tools = gateBridgeTools()
+  if (format === "responses") {
+    const payload = { model: id, input: "ping", max_output_tokens: 32, stream: true }
+    const converted = chatToolsToResponses(tools)
+    if (converted) payload.tools = converted
+    return payload
+  }
+  const payload = { model: id, messages: [{ role: "user", content: "ping" }], max_tokens: 5, stream: true }
+  if (tools.length) {
+    payload.tools = tools
+    // The bridge is for the gate, not the answer: a "ping" should come back as
+    // text, never as a tool call.
+    payload.tool_choice = "none"
+  }
+  return payload
+}
+
 // One-shot liveness probe for a model, using the endpoint family that model
 // actually lives on. Returns the raw Response so sync can classify it.
 async function probeModel(id, auth, session) {
   const format = modelFormat(id)
   const headers = {
     "content-type": "application/json",
-    accept: "application/json",
+    accept: "application/json, text/event-stream",
     authorization: auth,
     "user-agent": config.ua,
   }
   if (session) for (const h of SESSION_HEADERS) headers[h] = session
-  const payload =
-    format === "responses"
-      ? { model: id, input: "ping", max_output_tokens: 32 }
-      : { model: id, messages: [{ role: "user", content: "ping" }], max_tokens: 5 }
-  return fetch(`${config.upstream}${format === "responses" ? "/responses" : "/chat/completions"}`, {
+  const r = await fetch(`${config.upstream}${format === "responses" ? "/responses" : "/chat/completions"}`, {
     method: "POST",
     headers,
-    body: JSON.stringify(payload),
+    body: JSON.stringify(agentProbePayload(id, format)),
     signal: AbortSignal.timeout(Math.min(config.timeoutMs, 30_000)),
   })
+  // A live model answers the streamed probe with SSE, and sync only needs the
+  // status. Hang up instead of waiting for the model to finish its "ping".
+  if (r.ok) {
+    try { await r.body?.cancel() } catch {}
+  }
+  return r
 }
 
 // Stream a Responses SSE body back as chat.completion.chunk SSE.
@@ -1859,6 +2102,12 @@ async function fetchModels() {
         } else {
           free = upstreamModels.filter((m) => (m.id.endsWith("-free") || allowed.has(m.id)) && !dead.has(m.id))
         }
+        // Classifiers are real, callable endpoints, so they are listed rather than
+        // hidden — but they are not chat models and never enter models.json, which
+        // the model-sync Action and the Claude Code picker generator read as the
+        // chat catalog. The live upstream catalog is what lists them here.
+        const classifiers = upstreamModels.filter((m) => isSystemoneOnly(m.id) && !dead.has(m.id))
+        free = [...free, ...classifiers.filter((c) => !free.some((f) => f.id === c.id))]
         modelsCache = { at: Date.now(), data: free, ok: true }
       } else {
         modelsCache = { at: Date.now(), data: modelsCache.data, ok: false }
@@ -1933,18 +2182,22 @@ async function syncModels() {
           else if (r.status === 429 && !bodyErr) { rateLimited.push(id); modelHealth.set(id, 0) }
           else {
             // Only drop a model from the user's config on definitive proof that it
-            // is gone: "not supported", 404, "no such model". Everything else
-            // (403 FreeTierError, 429, timeouts, 5xx) is a *temporary* access or
-            // capacity condition — the model comes back on its own, so deleting it
-            // would silently shrink the user's list and lose it forever.
+            // is gone: "not supported", 404, 410 Gone, "no such model", "has been
+            // deprecated". Everything else (403 FreeTierError, 429, timeouts, 5xx)
+            // is a *temporary* access or capacity condition — the model comes back
+            // on its own, so deleting it would silently shrink the user's list and
+            // lose it forever.
             const gone =
               r.status === 404 ||
-              /model_not_found|no such model|does not exist|is not supported|not supported/i.test(bodyErr)
+              r.status === 410 ||
+              /model_not_found|no such model|does not exist|is not supported|not supported|has been deprecated|no longer available/i.test(bodyErr)
             // Key/auth problems are not model problems either.
             const authErr = /AuthError|invalid api key|missing api key/i.test(bodyErr)
-            // 403 FreeTierError means "only real opencode clients may use this".
-            // Our probe is not a real client, so this tells us nothing about
-            // whether the model works — don't call it flaky, and never remove it.
+            // 403 FreeTierError even though the probe was agent-shaped (tools +
+            // stream, see agentProbePayload). The gate refused the exact shape
+            // a real client sends — likely a session/trust condition the probe
+            // can't satisfy, so it says nothing about the model's health. Never
+            // call it flaky, never remove it.
             const isGated = /FreeTierError|free tier can only/i.test(bodyErr)
             // Temporary blocks: keep the model, just remember it is unhealthy.
             const temporary = /RegionError|not available in your country|rate.?limit|overloaded/i.test(bodyErr)
@@ -1992,9 +2245,9 @@ async function syncModels() {
       if (fallbackModelsPinned) {
         try { saveConfig({ fallbackModels: newList }) } catch {}
       }
-      log(`auto-sync: updated model list (${working.length} ok, ${rateLimited.length} rate-limited, ${gated.length} agent-only, ${systemone.length} systemone, ${flaky.length} flaky, ${dead.length} dead${fallbackModelsPinned ? "" : ", not pinned"})`)
+      log(`auto-sync: updated model list (${working.length} ok, ${rateLimited.length} rate-limited, ${gated.length} gate-blocked, ${systemone.length} systemone, ${flaky.length} flaky, ${dead.length} dead${fallbackModelsPinned ? "" : ", not pinned"})`)
     } else {
-      log(`auto-sync: list unchanged (${working.length} ok, ${rateLimited.length} rate-limited, ${gated.length} agent-only, ${systemone.length} systemone, ${flaky.length} flaky, ${dead.length} dead)`)
+      log(`auto-sync: list unchanged (${working.length} ok, ${rateLimited.length} rate-limited, ${gated.length} gate-blocked, ${systemone.length} systemone, ${flaky.length} flaky, ${dead.length} dead)`)
     }
     syncState.working = working
     syncState.rateLimited = rateLimited
@@ -2277,7 +2530,7 @@ async function handleTest(req, res) {
       headers: (() => {
         const h = {
           "content-type": "application/json",
-          accept: "application/json",
+          accept: "application/json, text/event-stream",
           authorization: auth,
           "user-agent": config.ua,
         }
@@ -2287,16 +2540,15 @@ async function handleTest(req, res) {
         if (!ipOmit(ip)) h["x-real-ip"] = ip
         return h
       })(),
-      body: JSON.stringify(
-        systemone
-          ? { model, state: "ping", questions: { ping: { type: "noul", instructions: "Is this request a liveness check?" } } }
-          : format === "responses"
-            ? { model, input: "ping", max_output_tokens: 32 }
-            : { model, messages: [{ role: "user", content: "ping" }], max_tokens: 5 },
-      ),
+      // Same agent-shaped payload the sync probe sends, so TEST reports what a
+      // real client would get instead of a gate refusal it never earned.
+      body: JSON.stringify(agentProbePayload(model, format)),
       signal: AbortSignal.timeout(config.timeoutMs),
     })
     noteKeyUsed(auth, upstreamRes.status)
+    if (upstreamRes.ok) {
+      try { await upstreamRes.body?.cancel() } catch {}
+    }
     let detail = ""
     let gated = false
     try {
@@ -2304,8 +2556,9 @@ async function handleTest(req, res) {
       if (systemone) detail = parsed.error?.message ?? JSON.stringify(parsed).slice(0, 300)
       else if (format === "responses") detail = parsed.error?.message ?? (typeof parsed.output_text === "string" ? parsed.output_text : "")
       else detail = parsed.error?.message ?? parsed.choices?.[0]?.message?.content ?? ""
-      // A free-tier gate here is not a failure of the model: the free tier only
-      // accepts genuine agent traffic, which a bare ping never is.
+      // A FreeTierError on an agent-shaped probe means the gate refused even the
+      // shape a real client sends; flag it, but it still may not be the model's
+      // fault, so it is reported as gated rather than broken.
       if (upstreamRes.status === 403 && /FreeTierError|free tier can only/i.test(detail)) gated = true
     } catch {}
     json(res, 200, {
@@ -2315,7 +2568,7 @@ async function handleTest(req, res) {
       format,
       status: upstreamRes.status,
       ms: Date.now() - start,
-      detail: gated ? "free tier accepts real agent requests only — this probe can't verify it" : detail,
+      detail: gated ? "the free-tier gate refused even an agent-shaped probe — real agent traffic may still get through" : detail,
     })
   } catch (err) {
     if (err && err.statusCode === 413) {
@@ -2505,6 +2758,19 @@ const server = http.createServer(router)
 server.requestTimeout = 0
 server.headersTimeout = 60_000
 
+// A proxy is a long-lived daemon: one bad request must not take it down for the
+// rest of the session. Node kills the process on an unhandled rejection by
+// default, and there are fire-and-forget calls here (the stream relays, the
+// periodic sync and UA refresh), so a single thrown error used to end the
+// server with nothing in the client's face but a connection error. Log it and
+// keep serving.
+process.on("unhandledRejection", (err) => {
+  log(`unhandled rejection (ignored): ${err?.stack || err?.message || err}`)
+})
+process.on("uncaughtException", (err) => {
+  log(`uncaught exception (ignored): ${err?.stack || err?.message || err}`)
+})
+
 server.on("error", (err) => {
   if (err.code === "EADDRINUSE") {
     console.error(`Port ${config.port} already in use. Set PORT or edit zen-proxy.json.`)
@@ -2607,6 +2873,8 @@ export {
   scheduleUA,
   parseRetryAfter,
   retryableUpstream,
+  transientUpstream,
+  maxBodyBytes,
   toBool,
   sessionFor,
   sessionHeader,
