@@ -64,6 +64,15 @@ curl -s http://127.0.0.1:8787/v1/chat/completions \
   -d '{"model":"space-bunny-free","messages":[{"role":"user","content":"say hi"}]}'
 ```
 
+## WARP
+
+The upstream calls can be sent through Cloudflare WARP (or any HTTP CONNECT proxy) with a local relay that falls back to a direct socket when the hop is down.
+
+- `sudo bash deploy/install-warp.sh` — installs WARP, the relay unit, and the zen-proxy drop-in
+- `zen-proxy.json` → `warpProxy`: `{ "enabled": true, "port": 8890, "hop": "http://127.0.0.1:40000", "fallback": "direct" }`
+- Node reads `NODE_USE_ENV_PROXY=1` and `HTTPS_PROXY=http://127.0.0.1:8890` when the process starts, so they belong in the service unit
+- `curl -s http://127.0.0.1:8890/__status` — tunnel counters; `GET /api/status` reports the same under `warp`
+
 ## More
 
 - Full documentation: [README.md](README.md)

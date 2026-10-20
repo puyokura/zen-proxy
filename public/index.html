@@ -424,6 +424,9 @@ textarea { resize:vertical; min-height:96px; font-family:var(--mono); font-size:
             <span class="hint mono" id="cfgAuth"></span>
             <span class="hint" id="zenKeyHint" style="min-height:16px"></span>
           </div>
+          <div class="row" style="gap:8px;margin-top:2px">
+            <span class="hint mono" id="cfgWarp"></span>
+          </div>
           <label>Timeout (ms)</label><input id="cfgTimeout" type="number">
         </div>
       </div>
@@ -783,6 +786,13 @@ async function populateConfigForm() {
     const eff = st.effectiveDefault ? " · auto→" + st.effectiveDefault : ""
     $("cfgDefault").placeholder = eff ? "auto → " + st.effectiveDefault : "(auto)"
     $("cfgAuth").textContent = "auth: " + modeLabel + (auth.zenKey ? " (" + auth.zenKey + ")" : "") + eff
+    const warp = st.warp || {}
+    $("cfgWarp").textContent = warp.enabled
+      ? "hop: " + (warp.hop || "(unset)") +
+        " · relay " + (warp.running ? "up" : "down") +
+        " · tunnels " + (warp.tunnels ?? 0) +
+        " (hop " + (warp.viaHop ?? 0) + " / direct " + (warp.viaDirect ?? 0) + " / fallbacks " + (warp.fallbacks ?? 0) + ")"
+      : "hop: off"
   } catch {}
 }
 

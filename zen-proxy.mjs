@@ -245,6 +245,16 @@ const DEFAULT_CONFIG = {
   // `refs:` whose name is listed in zenKeysRefs are read.
   zenKeysFile: String(ENV.ZEN_KEYS_FILE ?? "").trim(),
   zenKeysRefs: parseList(ENV.ZEN_KEYS_REFS ?? ""),
+  // A proxy hop (Cloudflare WARP in proxy mode, or any HTTP CONNECT proxy) in
+  // front of every upstream call. The relay that opens the tunnels runs inside
+  // this process, so a stopped hop falls back to a direct socket instead of
+  // taking the upstream down with it.
+  warpProxy: {
+    enabled: ENV.WARP_PROXY_ENABLED !== "0" && Boolean(ENV.WARP_PROXY_HOP),
+    port: Number(ENV.WARP_PROXY_PORT ?? 8890),
+    hop: String(ENV.WARP_PROXY_HOP ?? "").trim(),
+    fallback: ENV.WARP_PROXY_FALLBACK ?? "direct",
+  },
   trustForwarded: ENV.TRUST_FORWARDED === "1",
   timeoutMs: Number(ENV.TIMEOUT_MS ?? 120000),
   cacheMs: Number(ENV.CACHE_MS ?? 30000),
@@ -263,6 +273,16 @@ function loadConfig() {
   try {
     const raw = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8"))
     const merged = { ...DEFAULT_CONFIG, ...raw }
+    // The proxy hop is a nested block: a config file that only sets one of its
+    // fields still needs the others, so merge it field by field.
+    merged.warpProxy = {
+      ...DEFAULT_CONFIG.warpProxy,
+      ...(raw.warpProxy && typeof raw.warpProxy === "object" ? raw.warpProxy : {}),
+    }
+    merged.warpProxy.port = Number(merged.warpProxy.port) || DEFAULT_CONFIG.warpProxy.port
+    merged.warpProxy.hop = String(merged.warpProxy.hop ?? "").trim()
+    merged.warpProxy.fallback = merged.warpProxy.fallback === "none" ? "none" : "direct"
+    merged.warpProxy.enabled = Boolean(merged.warpProxy.enabled && merged.warpProxy.hop)
     // A config file that predates the models.json catalog still holds a list
     // written by an older build. Those are only ever subsets of what we shipped
     // (the runtime sync used to prune dead entries and save the result), so
@@ -2416,6 +2436,18 @@ async function handleApiConfig(req, res) {
       }
       cleaned.zenKeysRefs = Array.isArray(cleaned.zenKeysRefs) ? cleaned.zenKeysRefs.map(String) : config.zenKeysRefs
       if (typeof cleaned.zenKeysFile !== "string") cleaned.zenKeysFile = config.zenKeysFile
+      // The proxy hop is a nested block: keep the stored values for anything the
+      // caller did not send, and normalise the fields the relay depends on.
+      const incomingWarp = cleaned.warpProxy && typeof cleaned.warpProxy === "object" ? cleaned.warpProxy : {}
+      cleaned.warpProxy = {
+        ...config.warpProxy,
+        ...incomingWarp,
+        hop: String(incomingWarp.hop ?? config.warpProxy?.hop ?? "").trim(),
+        port: Number(incomingWarp.port ?? config.warpProxy?.port) || DEFAULT_CONFIG.warpProxy.port,
+        fallback: incomingWarp.fallback === "none" ? "none" : "direct",
+      }
+      cleaned.warpProxy.enabled = Boolean(cleaned.warpProxy.enabled && cleaned.warpProxy.hop)
+      const warpChanged = JSON.stringify(cleaned.warpProxy) !== JSON.stringify(config.warpProxy)
       if (!Array.isArray(cleaned.fallbackModels)) cleaned.fallbackModels = config.fallbackModels
       // Saving from the dashboard is an explicit edit of the list, so from here on
       // this install owns it rather than tracking models.json.
@@ -2428,6 +2460,7 @@ async function handleApiConfig(req, res) {
       scheduleSync()
       scheduleUA()
       log("config updated via UI")
+      if (warpChanged) log("proxy hop settings changed — restart zen-proxy to apply them")
       return json(res, 200, { config: sanitize(config) })
     } catch (err) {
       if (err && err.statusCode === 413) {
@@ -2473,6 +2506,7 @@ async function handleStatus(req, res) {
     effectiveDefault: effectiveDefault(),
     auth: { mode: authMode, zenKey: maskKey(config.defaultZenKey), proxyKey: !!config.proxyKey, accounts: pool.accounts },
     keys: pool,
+    warp: await relayStatus(),
     responsesModels: [...(config.responsesModels ?? [])],
     rateLimit: { max: config.rateLimitMax, windowMs: config.rateLimitWindowMs },
     probeAuth: config.probeAuth ?? "auto",
@@ -2753,6 +2787,62 @@ async function router(req, res) {
   json(res, 404, { error: { type: "not_found", message: p } })
 }
 
+// --- proxy hop (Cloudflare WARP and friends) --------------------------------
+//
+// The hop is an HTTP CONNECT proxy: Cloudflare WARP in proxy mode listens on
+// 127.0.0.1:40000 and speaks both SOCKS5 and CONNECT. It is reached through a
+// small local relay (scripts/warp-relay.mjs) that owns the tunnels and falls
+// back to a direct socket when the hop is down, so a stopped WARP service
+// cannot take the upstream with it.
+//
+// Node reads NODE_USE_ENV_PROXY / HTTPS_PROXY when the process starts, so the
+// service unit has to carry them:
+//
+//   Environment=NODE_USE_ENV_PROXY=1
+//   Environment=HTTPS_PROXY=http://127.0.0.1:8890
+//
+// The relay runs as its own unit; deploy/zen-proxy-warp-relay.service is the
+// template, and deploy/zen-proxy-warp-proxy.service is the drop-in for the
+// zen-proxy unit.
+
+// The relay is asked over plain HTTP (node:http, not fetch) so the query never
+// depends on the proxy settings it is reporting on.
+function httpGetJson(url, timeoutMs = 2000) {
+  return new Promise((resolve, reject) => {
+    const req = http.get(url, { timeout: timeoutMs }, (res) => {
+      const chunks = []
+      res.on("data", (c) => chunks.push(c))
+      res.on("end", () => {
+        try {
+          resolve(JSON.parse(Buffer.concat(chunks).toString("utf8")))
+        } catch (err) {
+          reject(err)
+        }
+      })
+    })
+    req.on("timeout", () => req.destroy(new Error("relay status timed out")))
+    req.on("error", reject)
+  })
+}
+
+async function relayStatus() {
+  const wp = config.warpProxy ?? {}
+  const base = {
+    enabled: Boolean(wp.enabled && wp.hop),
+    hop: String(wp.hop ?? ""),
+    fallback: wp.fallback ?? "direct",
+    port: Number(wp.port ?? 0),
+    proxyEnv: String(process.env.HTTPS_PROXY || process.env.HTTP_PROXY || ""),
+  }
+  if (!base.enabled) return { ...base, running: false }
+  try {
+    const data = await httpGetJson(`http://127.0.0.1:${base.port}/__status`)
+    return { ...base, running: true, ...data }
+  } catch {
+    return { ...base, running: false }
+  }
+}
+
 const server = http.createServer(router)
 
 server.requestTimeout = 0
@@ -2785,6 +2875,15 @@ if (isMain) {
     log(`zen-proxy listening on http://${config.host}:${config.port}`)
     log(`upstream ${config.upstream}  UA ${config.ua}  default ${config.defaultModel || "(auto)"}`)
     log(`config file: ${CONFIG_PATH}  UI: /`)
+    if (config.warpProxy?.enabled && config.warpProxy.hop) {
+      const relayUrl = `http://127.0.0.1:${config.warpProxy.port}`
+      const proxyEnv = String(process.env.HTTPS_PROXY || process.env.HTTP_PROXY || "")
+      if (proxyEnv !== relayUrl) {
+        log(`proxy hop ${config.warpProxy.hop} is configured, but HTTPS_PROXY does not point at ${relayUrl} (${proxyEnv || "not set"}) — the upstream calls stay direct`)
+      } else {
+        log(`proxy hop ${config.warpProxy.hop} via relay ${relayUrl} (fallback ${config.warpProxy.fallback})`)
+      }
+    }
     if (!fs.existsSync(CONFIG_PATH)) {
       try {
         // fallbackModels is deliberately left out: it comes from models.json, so
@@ -2838,6 +2937,7 @@ export {
   isSystemoneOnly,
   systemoneURL,
   handleSystemone,
+  relayStatus,
   parseList,
   clientIp,
   ipOmit,

@@ -159,8 +159,9 @@ The OpenAI-shaped routes get no name mapping, so they are handled differently: a
 | `timeoutMs` / `cacheMs` | `120000` / `30000` | Upstream timeout, `/v1/models` cache TTL |
 | `autoSync` / `autoSyncIntervalMs` | `true` / `3600000` | Runtime discovery of newly-offered free models |
 | `trustForwarded` | `false` | Honour `x-forwarded-for` behind a reverse proxy |
+| `warpProxy` | `{ "enabled": false, "port": 8890, "hop": "", "fallback": "direct" }` | Send the upstream calls through a local relay that tunnels over an HTTP CONNECT proxy — Cloudflare WARP in proxy mode, or any CONNECT proxy. The relay falls back to a direct socket when the hop is down. See [WARP](#warp) |
 
-`HOST` `PORT` `ZEN_URL` `ZEN_UA` `INJECT_SESSION=0` `AUTO_UA=0` `UA_REFRESH_MS` `AGENT_TOOLS=0` `PROBE_AUTH` `DEFAULT_MODEL` `FALLBACK_MODELS` `MODEL_ALIASES` `RESPONSES_MODELS` `PROXY_KEY` `ZEN_KEY` `ZEN_KEYS` `ZEN_KEYS_FILE` `ZEN_KEYS_REFS` `TRUST_FORWARDED=1` `TIMEOUT_MS` `CACHE_MS` `RATE_LIMIT_MAX` `RATE_LIMIT_WINDOW_MS` `AUTO_SYNC=0` `AUTO_SYNC_MS` `ZEN_PROXY_CONFIG`
+`HOST` `PORT` `ZEN_URL` `ZEN_UA` `INJECT_SESSION=0` `AUTO_UA=0` `UA_REFRESH_MS` `AGENT_TOOLS=0` `PROBE_AUTH` `DEFAULT_MODEL` `FALLBACK_MODELS` `MODEL_ALIASES` `RESPONSES_MODELS` `PROXY_KEY` `ZEN_KEY` `ZEN_KEYS` `ZEN_KEYS_FILE` `ZEN_KEYS_REFS` `TRUST_FORWARDED=1` `TIMEOUT_MS` `CACHE_MS` `RATE_LIMIT_MAX` `RATE_LIMIT_WINDOW_MS` `AUTO_SYNC=0` `AUTO_SYNC_MS` `WARP_PROXY_ENABLED=0` `WARP_PROXY_PORT` `WARP_PROXY_HOP` `WARP_PROXY_FALLBACK` `ZEN_PROXY_CONFIG`
 
 Anonymous `public` access shares a per-IP quota that is sometimes saturated. Set `defaultZenKey`, or send `x-zen-key` per request, for steadier service. With several accounts configured (`zenKeys` or the refs of `zenKeysFile`) they are used in turn, so a per-account quota is no longer the ceiling; `/api/status` reports the pool and per-account request counts, masked.
 </details>
@@ -221,6 +222,42 @@ export PATH="$HOME/.local/bin:$PATH"                          # this terminal
 echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc      # permanent
 ```
 </details>
+
+---
+
+## WARP
+
+Put the upstream calls behind [Cloudflare WARP](https://developers.cloudflare.com/cloudflare-one/team-and-resources/devices/cloudflare-one-client/download/). Two reasons it comes up: the free tier is bound to the exit address, and a shared or blocked exit is refused outright — upstream answers `FreeTierError: free models aren't available from your current network because we've detected abusive traffic from this IP address`.
+
+The hop is an HTTP CONNECT proxy. Cloudflare WARP in proxy mode speaks it on `127.0.0.1:40000`, and so does any other CONNECT proxy. It is reached through a small relay, `scripts/warp-relay.mjs`, because Node's env proxy has no failover: without the relay a stopped WARP service would take every upstream call down with it. The relay opens each tunnel over the hop and falls back to a direct socket when the hop is unreachable, so the proxy stays usable either way.
+
+```bash
+sudo bash deploy/install-warp.sh          # WARP + relay unit + zen-proxy drop-in
+curl -s http://127.0.0.1:8890/__status    # tunnel counters, hop vs direct
+curl -s http://127.0.0.1:8787/api/status  # the same numbers, from the dashboard
+```
+
+What it installs:
+
+| Piece | Where | What it does |
+|---|---|---|
+| `cloudflare-warp` | apt (official repo) | The hop itself, in proxy mode; the host's routing is untouched |
+| `zen-proxy-warp-relay.service` | `/etc/systemd/system` | Runs the relay on `127.0.0.1:8890` |
+| `zen-proxy.service.d/warp-proxy.conf` | `/etc/systemd/system` | `NODE_USE_ENV_PROXY=1` and `HTTPS_PROXY=http://127.0.0.1:8890` |
+
+Node reads those two variables when the process starts, so the drop-in is the only place that can turn the hop on — set them in the unit, not in a shell. The relay's port has to match `HTTPS_PROXY`; both default to `8890`.
+
+Roll back:
+
+```bash
+sudo systemctl disable --now zen-proxy-warp-relay
+sudo rm /etc/systemd/system/zen-proxy-warp-relay.service \
+         /etc/systemd/system/zen-proxy.service.d/warp-proxy.conf
+sudo systemctl daemon-reload && sudo systemctl restart zen-proxy
+sudo warp-cli --accept-tos registration delete && sudo apt-get remove -y cloudflare-warp
+```
+
+Two things worth knowing before you turn it on: the upstream then sees the WARP exit address instead of yours, and WARP hands out a different exit address per connection, so a quota tied to one address is not guaranteed to follow you.
 
 ---
 

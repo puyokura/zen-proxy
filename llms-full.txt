@@ -185,12 +185,41 @@ Config lives in **`zen-proxy.json`** (auto-created on first run, hot-reloaded wh
 | `trustForwarded` | `false` | Trust `x-forwarded-for`/`x-real-ip` from a reverse proxy |
 | `timeoutMs` | `120000` | Upstream timeout for non-streaming |
 | `cacheMs` | `30000` | `/v1/models` cache TTL |
+| `warpProxy` | `{ "enabled": false, "port": 8890, "hop": "", "fallback": "direct" }` | Send the upstream calls through the local relay, which tunnels over an HTTP CONNECT proxy (Cloudflare WARP in proxy mode, or any CONNECT proxy) and falls back to a direct socket when the hop is down |
 
-Env vars: `HOST`, `PORT`, `ZEN_URL`, `ZEN_UA`, `INJECT_SESSION` (`0` to disable), `AUTO_UA` (`0` to disable), `UA_REFRESH_MS`, `PROBE_AUTH`, `RESPONSES_MODELS` (JSON), `RATE_LIMIT_MAX`, `RATE_LIMIT_WINDOW_MS`, `DEFAULT_MODEL`, `FALLBACK_MODELS` (JSON), `MODEL_ALIASES` (JSON), `PROXY_KEY`, `ZEN_KEY`, `ZEN_KEYS`, `ZEN_KEYS_FILE`, `ZEN_KEYS_REFS`, `TRUST_FORWARDED=1`, `TIMEOUT_MS`, `CACHE_MS`, `ZEN_PROXY_CONFIG` (custom config path).
+Env vars: `HOST`, `PORT`, `ZEN_URL`, `ZEN_UA`, `INJECT_SESSION` (`0` to disable), `AUTO_UA` (`0` to disable), `UA_REFRESH_MS`, `PROBE_AUTH`, `RESPONSES_MODELS` (JSON), `RATE_LIMIT_MAX`, `RATE_LIMIT_WINDOW_MS`, `DEFAULT_MODEL`, `FALLBACK_MODELS` (JSON), `MODEL_ALIASES` (JSON), `PROXY_KEY`, `ZEN_KEY`, `ZEN_KEYS`, `ZEN_KEYS_FILE`, `ZEN_KEYS_REFS`, `TRUST_FORWARDED=1`, `TIMEOUT_MS`, `CACHE_MS`, `WARP_PROXY_ENABLED=0`, `WARP_PROXY_PORT`, `WARP_PROXY_HOP`, `WARP_PROXY_FALLBACK`, `ZEN_PROXY_CONFIG` (custom config path).
 
 ### bring your own key
 
 Anonymous `public` access rides opencode's shared free pool (per-IP quota, sometimes saturated). For stable, reliable use set `defaultZenKey` to your own free Zen key — or send it per request as `x-zen-key` / a non-`public` bearer token. With more than one account (`zenKeys`, or the `refs` named in `zenKeysRefs` of `zenKeysFile`) requests start on the next account in turn, `401`/`429` hands the request to the following account, and the anonymous tier remains the last resort; `/api/status` reports the pool and each account's request count, masked.
+
+---
+
+## warp (the upstream behind cloudflare warp)
+
+The free tier is tied to the exit address, and a shared exit is refused outright — upstream answers `FreeTierError: free models aren't available from your current network because we've detected abusive traffic from this IP address`. Cloudflare WARP gives the host a different exit address; in proxy mode it speaks HTTP CONNECT on `127.0.0.1:40000` and leaves the host's routing alone.
+
+The hop is reached through `scripts/warp-relay.mjs`, a small local relay: it opens each tunnel over the hop and falls back to a direct socket when the hop is unreachable. Node's own env proxy has no failover, so pointing `HTTPS_PROXY` straight at WARP would take every upstream call down whenever `warp-svc` stops.
+
+```bash
+sudo bash deploy/install-warp.sh     # WARP + relay unit + zen-proxy drop-in
+```
+
+| Piece | Where |
+|---|---|
+| `cloudflare-warp` | apt, official repo; proxy mode, `127.0.0.1:40000` |
+| `zen-proxy-warp-relay.service` | `/etc/systemd/system` — the relay on `127.0.0.1:8890` |
+| `zen-proxy.service.d/warp-proxy.conf` | `/etc/systemd/system` — `NODE_USE_ENV_PROXY=1`, `HTTPS_PROXY=http://127.0.0.1:8890` |
+
+Node reads `NODE_USE_ENV_PROXY` and `HTTPS_PROXY` when the process starts, so they belong in the unit file, not in a shell. `zen-proxy.json` carries the hop itself:
+
+```json
+{ "warpProxy": { "enabled": true, "port": 8890, "hop": "http://127.0.0.1:40000", "fallback": "direct" } }
+```
+
+`fallback: "direct"` means the relay uses a direct socket when the hop is down; `"none"` refuses instead. `GET /api/status` reports the hop under `warp` (tunnel counters, how many went over the hop, how many fell back), and the relay answers the same on `http://127.0.0.1:8890/__status`.
+
+The upstream then sees the WARP exit address instead of yours, and WARP hands out a different exit address per connection — a quota tied to one address is not guaranteed to follow.
 
 ---
 
