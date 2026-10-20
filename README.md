@@ -20,6 +20,18 @@
 
 ---
 
+## This fork
+
+A fork of [12errh/zen-proxy](https://github.com/12errh/zen-proxy) that tracks `upstream/main` — a fork update is a plain `git pull` — and adds three opt-in things on top:
+
+- **Several Zen accounts on one endpoint.** `zenKeys`, or the `refs:` names listed in `zenKeysRefs` of `zenKeysFile` (for example `~/.dsh/.credentials.yaml`), form a pool: requests start on the next account in turn, a `401`/`429` hands the request to the following account, and the anonymous tier stays the last resort. `/api/status` reports the pool and each account's request count, masked.
+- **The System One classifier.** `POST /v1/systemone` relays `jev-*` requests unchanged, so a classifier can be used alongside the chat models. `jev-*` shows up on `/v1/models`; asking for one on a chat route comes back as a `400` that points at `/v1/systemone`.
+- **A Cloudflare WARP hop.** `deploy/install-warp.sh` puts the upstream calls behind WARP through `scripts/warp-relay.mjs`, which falls back to a direct socket when the hop is down. See [WARP](#warp).
+
+Everything else follows upstream, including `models.json`, the installer and the model-sync workflow.
+
+---
+
 ## Start here
 
 ### Install
