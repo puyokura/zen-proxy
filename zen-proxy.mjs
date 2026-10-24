@@ -2199,7 +2199,14 @@ async function syncModels() {
             }
           } catch {}
           if (r.ok && !bodyErr) { working.push(id); modelHealth.set(id, 0) }
-          else if (r.status === 429 && !bodyErr) { rateLimited.push(id); modelHealth.set(id, 0) }
+          // 429 is the account's free allowance, not the model's health. The body is
+          // usually a JSON error (FreeUsageLimitError / "Free usage limit reached"),
+          // and treating that as a model failure deleted every model from the user's
+          // list after three hourly syncs - long after the quota refilled.
+          else if (r.status === 429 || /FreeUsageLimit|usage.?limit|quota|too many requests/i.test(bodyErr)) {
+            rateLimited.push(id)
+            modelHealth.set(id, 0)
+          }
           else {
             // Only drop a model from the user's config on definitive proof that it
             // is gone: "not supported", 404, 410 Gone, "no such model", "has been

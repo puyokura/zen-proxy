@@ -692,6 +692,39 @@ describe("sync prunes unsupported models", () => {
     }
   })
 
+  test("repeated 429 FreeUsageLimitError never deletes the model from config", async () => {
+    // The free allowance is per account: when it runs out every model answers
+    // 429 {type:"FreeUsageLimitError"}. That is a quota condition, not a retired
+    // model - deleting the list would leave the install serving only the
+    // classifier long after the quota refills.
+    const list = ["space-bunny-free", "mimo-v2.5-free", "big-pickle"]
+    zp.saveConfig({ fallbackModels: [...list], defaultModel: "", autoSyncIntervalMs: 0, cacheMs: 0 })
+    const exhausted = () =>
+      jsonResponse(
+        {
+          type: "error",
+          error: { type: "FreeUsageLimitError", message: "Free usage limit reached. Subscribe to OpenCode Go to keep going." },
+        },
+        429,
+      )
+    globalThis.fetch = routeFetch([
+      ["/models", () => jsonResponse({ data: list.map((id) => ({ id })) })],
+      [
+        "/chat/completions",
+        (u, opts) => (JSON.parse(opts.body).model === "space-bunny-free" ? jsonResponse({ model: "ok", choices: [] }) : exhausted()),
+      ],
+    ])
+    for (let i = 0; i < 3; i++) {
+      const s = await zp.syncModels()
+      assert.equal(s.ok, true)
+      assert.deepEqual([...zp.config.fallbackModels].sort(), [...list].sort(), `config intact after sync #${i + 1}`)
+      assert.ok(!s.dead.includes("mimo-v2.5-free"), "quota exhaustion is not 'dead'")
+      assert.ok(s.rateLimited.includes("mimo-v2.5-free"), "reported as rate-limited")
+    }
+    const models = await zp.fetchModels()
+    assert.deepEqual(models.data.map((m) => m.id).sort(), [...list].sort(), "the catalog still lists every model")
+  })
+
   test("a model that comes back is reported working again", async () => {
     const list = ["space-bunny-free", "mimo-v2.5-free"]
     zp.saveConfig({ fallbackModels: [...list], defaultModel: "", autoSyncIntervalMs: 0, cacheMs: 0 })
