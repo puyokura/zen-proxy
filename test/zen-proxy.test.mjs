@@ -1701,6 +1701,73 @@ describe("handleChat", () => {
     assert.match(res.body, /FreeUsageLimitError/)
   })
 
+  test("free usage limit stops the chat chain once every account is dry", async () => {
+    zp.saveConfig({
+      defaultZenKey: "",
+      zenKeys: ["key-a", "key-b"],
+      zenKeysFile: "",
+      zenKeysRefs: [],
+      retriesPerModel: 2,
+      fallbackModels: ["space-bunny-free", "mimo-v2.5-free"],
+      defaultModel: "",
+      autoSyncIntervalMs: 0,
+      cacheMs: 0,
+    })
+    const calls = []
+    globalThis.fetch = routeFetch([
+      [
+        "/chat/completions",
+        (u, opts) => {
+          calls.push(JSON.parse(opts.body).model)
+          return jsonResponse(
+            { type: "error", error: { type: "FreeUsageLimitError", message: "Free usage limit reached. Subscribe to OpenCode Go to keep going." } },
+            429,
+          )
+        },
+      ],
+    ])
+    const req = mockReq({ _body: JSON.stringify({ model: "space-bunny-free", messages: [] }) })
+    const res = mockRes()
+    await zp.handleChat(req, res)
+    assert.equal(res.state.status, 429)
+    assert.match(res.body, /FreeUsageLimitError/)
+    // Two accounts plus the anonymous tier, then stop: the quota is account-wide,
+    // so the second model cannot answer and must not be tried.
+    assert.deepEqual(calls, ["space-bunny-free", "space-bunny-free", "space-bunny-free"])
+  })
+
+  test("free usage limit stops the Anthropic chain too", async () => {
+    zp.saveConfig({
+      defaultZenKey: "",
+      zenKeys: ["key-a", "key-b"],
+      zenKeysFile: "",
+      zenKeysRefs: [],
+      retriesPerModel: 2,
+      fallbackModels: ["space-bunny-free", "mimo-v2.5-free"],
+      defaultModel: "",
+      autoSyncIntervalMs: 0,
+      cacheMs: 0,
+    })
+    const calls = []
+    globalThis.fetch = routeFetch([
+      [
+        "/chat/completions",
+        (u, opts) => {
+          calls.push(JSON.parse(opts.body).model)
+          return jsonResponse({ type: "error", error: { type: "FreeUsageLimitError", message: "Free usage limit reached." } }, 429)
+        },
+      ],
+    ])
+    const req = mockReq({
+      _body: JSON.stringify({ model: "space-bunny-free", max_tokens: 16, messages: [{ role: "user", content: "hi" }] }),
+    })
+    const res = mockRes()
+    await zp.handleMessages(req, res)
+    assert.equal(res.state.status, 429)
+    assert.match(res.body, /rate_limit_error/)
+    assert.deepEqual(calls, ["space-bunny-free", "space-bunny-free", "space-bunny-free"])
+  })
+
   test("non-retryable 400 propagates its status, not 429", async () => {
     const m = zp.config.fallbackModels[0]
     globalThis.fetch = routeFetch([

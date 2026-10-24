@@ -1113,6 +1113,17 @@ function keyRotationWorthy(status, body) {
   return /rate.?limit|usage limit|quota|invalid api key|missing api key|unauthor/i.test(msg)
 }
 
+// The free allowance is per account, not per model. Once every account has
+// answered with the quota error, walking the remaining models can only repeat
+// the same 429: it used to spend ~90s and ~31 upstream calls on a single turn
+// that was already decided. Nothing about the model is at fault here.
+function freeUsageExhausted(status, body) {
+  if (status !== 429) return false
+  const t = String(body?.error?.type ?? body?.type ?? "")
+  const msg = String(body?.error?.message ?? body?.message ?? "")
+  return /FreeUsageLimit/i.test(t) || /free usage limit|usage limit reached|quota (exceeded|reached)/i.test(msg)
+}
+
 // Key order for one request: the next pool key first (round-robin), then the
 // rest. A key the client sent is honoured as sent; `includePoolFallback` lets
 // the configured pool rescue a placeholder token, which is what Anthropic
@@ -1343,6 +1354,13 @@ async function handleMessages(req, res) {
       }
       lastStatus = upstreamRes.status
       const retryAfterMs = Math.min(parseRetryAfter(upstreamRes.headers.get("retry-after")) * 1000, 3000)
+      if (freeUsageExhausted(upstreamRes.status, lastErr)) {
+        recordReq(req, requested, Date.now() - start, lastStatus)
+        const e = anthropicError(lastStatus, lastErr)
+        res.writeHead(e.status, { "content-type": "application/json" })
+        res.end(JSON.stringify(e.body))
+        return
+      }
       if (transientUpstream(upstreamRes.status, lastErr) && attempt < retries) {
         delayMs = Math.max(config.retryBackoffMs * (attempt + 1), retryAfterMs)
         continue
@@ -1523,6 +1541,12 @@ async function handleChat(req, res) {
       }
       lastStatus = upstreamRes.status
       const retryAfterMs = Math.min(parseRetryAfter(upstreamRes.headers.get("retry-after")) * 1000, 3000)
+      if (freeUsageExhausted(upstreamRes.status, lastErr)) {
+        recordReq(req, requested, Date.now() - start, lastStatus)
+        res.writeHead(lastStatus, { "content-type": "application/json" })
+        res.end(JSON.stringify(lastErr))
+        return
+      }
       if (transientUpstream(upstreamRes.status, lastErr) && attempt < retries) {
         delayMs = Math.max(config.retryBackoffMs * (attempt + 1), retryAfterMs)
         continue
