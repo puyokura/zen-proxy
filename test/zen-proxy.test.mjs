@@ -164,6 +164,11 @@ beforeEach(() => {
   // The suite exercises the per-model classification, so it asks for a full
   // sweep; the shipped default is one probe (see syncProbeModels).
   if (originalConfig) zp.saveConfig({ ...originalConfig, syncProbeModels: 0, syncIdleMs: 0 })
+  // Account blocks and the egress choice are process state: each test starts
+  // from a clean slate or the previous case decides this one's call count.
+  zp.keyBlocks.clear()
+  Object.assign(zp.egressState.unhealthyUntil, { direct: 0, warp: 0 })
+  zp.initEgress()
   Object.assign(zp.requestStats, { total: 0, errors: 0, recent: [], perMinute: new Map(), window60: [] })
   Object.assign(zp.syncState, { at: 0, ok: false, running: false, ms: 0, working: [], rateLimited: [], flaky: [], gated: [], systemone: [], dead: [], error: "", streak: 0 })
 })
@@ -1901,11 +1906,12 @@ describe("handleChat", () => {
     assert.equal(res.state.status, 429)
     assert.match(res.body, /FreeUsageLimitError/)
     // The refusal is a verdict on the account and the exit, not on the model:
-    // two keys plus the anonymous tier, then exactly one retry on the other path.
-    assert.equal(calls.length, 4, `upstream calls: ${calls.length}`)
+    // the first key's 429 jumps to the anonymous tier (the exit probe), then one
+    // retry on the other path. Three calls, not forty.
+    assert.equal(calls.length, 3, `upstream calls: ${calls.length}`)
     assert.deepEqual([...new Set(calls)], ["space-bunny-free"], "the catalog is not walked")
     assert.equal(res.state.headers["retry-after"], "30", "the upstream retry-after is passed through")
-    assert.equal(zp.egressStatus().active, "warp", "the refused path was swapped")
+    assert.equal(zp.egressStatus().active, "direct", "both paths refused, so it does not stay on the failed one")
     assert.ok(Date.now() - started < 3000, "a refused turn must not take 80 seconds")
   })
 
@@ -1941,7 +1947,7 @@ describe("handleChat", () => {
     await zp.handleMessages(req, res)
     assert.equal(res.state.status, 429)
     assert.match(res.body, /rate_limit_error/)
-    assert.equal(calls.length, 4)
+    assert.equal(calls.length, 3)
     assert.deepEqual([...new Set(calls)], ["space-bunny-free"], "the catalog is not walked")
   })
 

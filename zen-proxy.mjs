@@ -1522,6 +1522,12 @@ function noteKeyUsed(auth, status) {
   else if (status === 403) rec.gated++
   else if (status >= 400) rec.errors++
   keyStats.set(label, rec)
+  // Keep the account out of the next few rotations: a spent key must not spend
+  // the shared bucket ahead of a working credential.
+  const raw = String(auth ?? "").replace(/^Bearer\s+/, "")
+  if (status === 429) blockKey(raw, 60_000)
+  else if (status === 401) blockKey(raw, 600_000)
+  else if (status >= 200 && status < 300) clearKeyBlock(raw)
 }
 
 // A rejected credential deserves the next account; a rejected request does not.
@@ -1551,19 +1557,46 @@ function upstreamAuths(req, includePoolFallback = false) {
     return { invalid: false, auths, supplied: true }
   }
   const pool = rotatedPool()
-  // The anonymous tier is the last resort behind the accounts: a key that has
-  // expired, been revoked, or is simply not a Zen credential must not take the
-  // whole endpoint down with it, and per-key usage plus the rotation log make
-  // the failure visible either way.
-  return { invalid: false, auths: pool.length ? [...pool, "Bearer public"] : ["Bearer public"], supplied: false }
+  // The anonymous tier is both an account and the exit probe: put it ahead of
+  // keys we already know are refused, so a spent key cannot burn the shared
+  // bucket before the credential that actually speaks for the path is tried.
+  const rawOf = (auth) => String(auth).replace(/^Bearer\s+/, "")
+  const live = pool.filter((auth) => !keyBlocked(rawOf(auth)))
+  const blocked = pool.filter((auth) => keyBlocked(rawOf(auth)))
+  return { invalid: false, auths: [...live, "Bearer public", ...blocked], supplied: false }
 }
 
 function rotatedPool() {
   const pool = poolKeys()
   if (!pool.length) return []
-  if (pool.length === 1) return [`Bearer ${pool[0]}`]
-  const start = keyCursor++ % pool.length
-  return [...pool.slice(start), ...pool.slice(0, start)].map((k) => `Bearer ${k}`)
+  // A key that just answered 429/401 is not tried first again: four spent keys
+  // ahead of the anonymous tier burn the same shared bucket that then refuses
+  // the tier itself (measured: the pool answered 429 five times in a row while a
+  // single anonymous request from the same host answered 200).
+  const now = Date.now()
+  const healthy = pool.filter((k) => !keyBlocked(k, now))
+  const blocked = pool.filter((k) => keyBlocked(k, now))
+  const rotate = (list) => {
+    if (list.length <= 1) return list
+    const start = keyCursor % list.length
+    return [...list.slice(start), ...list.slice(0, start)]
+  }
+  keyCursor++
+  return [...rotate(healthy), ...blocked].map((k) => `Bearer ${k}`)
+}
+
+// Per-account health, in memory: raw key -> epoch ms until which it is skipped.
+// A 429 is the account's own quota; a 401 is a dead credential. Both are
+// temporary for our purposes, and a success clears the mark.
+const keyBlocks = new Map()
+function keyBlocked(raw, now = Date.now()) {
+  return (keyBlocks.get(raw) ?? 0) > now
+}
+function blockKey(raw, ms) {
+  if (raw) keyBlocks.set(raw, Date.now() + ms)
+}
+function clearKeyBlock(raw) {
+  if (raw) keyBlocks.delete(raw)
 }
 
 function keyPoolStatus() {
@@ -1679,6 +1712,7 @@ async function handleMessages(req, res) {
   let phase = 0
   let fatalGate = false
   let lastRetryAfter = 0
+  let egressReturnPath = ""
   if (res.setHeader) res.setHeader("x-zen-egress", egressState.active)
   // The model the client chose is tried first; transient failures are retried
   // against that same model before the chain moves on.
@@ -1738,6 +1772,20 @@ async function handleMessages(req, res) {
       }
 
       noteKeyUsed(auth, upstreamRes.status)
+      // Two measured facts shape this: the free bucket is shared by the accounts
+      // on an exit (all four answered 429 together), and the anonymous tier is
+      // the credential that speaks for the exit. So a key's 429 jumps straight to
+      // the anonymous tier instead of burning the rest of the pool; the path
+      // verdict then comes from that one attempt.
+      if (upstreamRes.status === 429) {
+        const anon = auths.indexOf("Bearer public")
+        if (anon > ai) {
+          auth = auths[anon]
+          ai = anon
+          attempt--
+          continue
+        }
+      }
       // A rejected account is swapped before the model is abandoned (same rule as
       // the chat path), and the chain bounds how often that can happen.
       if (keyRotationWorthy(upstreamRes.status, null) && ai + 1 < auths.length) {
@@ -1807,15 +1855,29 @@ async function handleMessages(req, res) {
       const gateKind = config.freeTierFastFail ? gateRefusalKind(lastStatus, lastErr) : ""
       if (gateKind === "quota") {
         lastRetryAfter = Math.max(lastRetryAfter, parseRetryAfter(upstreamRes.headers.get("retry-after")))
-        if (phase === 0 && canSwitchEgress()) {
-          noteEgressRefusal(egressState.active, gateKind)
-          switchEgress(`all accounts refused on the previous path (${gateKind})`)
+        // A key's 429 is that key's own quota: it stops the sweep but says
+        // nothing about the exit. The anonymous tier is the exit probe - if it
+        // is refused, the path is refused, and the request gets one try on the
+        // other path with the same anonymous credential before the verdict.
+        if (auth === "Bearer public" && phase === 0 && canSwitchEgress()) {
+          const from = egressState.active
+          noteEgressRefusal(from, gateKind)
+          switchEgress(`anonymous tier refused on ${from} (${gateKind})`)
+          egressReturnPath = from
           if (res.setHeader) res.setHeader("x-zen-egress", egressState.active)
           phase = 1
+          auth = "Bearer public"
           ai = auths.length
-          auth = auths[0]
           attempt = -1
           continue
+        }
+        if (phase === 1 && egressReturnPath) {
+          // Neither path answered: staying on the one that just failed would
+          // keep the install down for the whole cooldown.
+          egressState.unhealthyUntil[egressState.active] = Date.now() + 30_000
+          egressState.active = egressReturnPath
+          egressState.reason = `both paths refused; back to ${egressReturnPath}`
+          if (res.setHeader) res.setHeader("x-zen-egress", egressState.active)
         }
         fatalGate = true
         break
@@ -1917,6 +1979,7 @@ async function handleChat(req, res, responsesRoute = false) {
   let phase = 0
   let fatalGate = false
   let lastRetryAfter = 0
+  let egressReturnPath = ""
   if (res.setHeader) res.setHeader("x-zen-egress", egressState.active)
   // The model the client chose is tried first; transient failures are retried
   // against that same model before the chain moves on.
@@ -2008,6 +2071,17 @@ async function handleChat(req, res, responsesRoute = false) {
       }
 
       noteKeyUsed(auth, upstreamRes.status)
+      // Same rule as the Anthropic path: a key's 429 is the shared bucket, so
+      // ask the anonymous tier (the exit probe) instead of the next key.
+      if (upstreamRes.status === 429) {
+        const anon = auths.indexOf("Bearer public")
+        if (anon > ai) {
+          auth = auths[anon]
+          ai = anon
+          attempt--
+          continue
+        }
+      }
       // A rejected account is swapped before the model is abandoned: the model is
       // fine, this credential is not. Each swap advances the chain, so the loop
       // is bounded by the number of accounts.
@@ -2111,15 +2185,29 @@ async function handleChat(req, res, responsesRoute = false) {
       const gateKind = config.freeTierFastFail ? gateRefusalKind(lastStatus, lastErr) : ""
       if (gateKind === "quota") {
         lastRetryAfter = Math.max(lastRetryAfter, parseRetryAfter(upstreamRes.headers.get("retry-after")))
-        if (phase === 0 && canSwitchEgress()) {
-          noteEgressRefusal(egressState.active, gateKind)
-          switchEgress(`all accounts refused on the previous path (${gateKind})`)
+        // A key's 429 is that key's own quota: it stops the sweep but says
+        // nothing about the exit. The anonymous tier is the exit probe - if it
+        // is refused, the path is refused, and the request gets one try on the
+        // other path with the same anonymous credential before the verdict.
+        if (auth === "Bearer public" && phase === 0 && canSwitchEgress()) {
+          const from = egressState.active
+          noteEgressRefusal(from, gateKind)
+          switchEgress(`anonymous tier refused on ${from} (${gateKind})`)
+          egressReturnPath = from
           if (res.setHeader) res.setHeader("x-zen-egress", egressState.active)
           phase = 1
+          auth = "Bearer public"
           ai = auths.length
-          auth = auths[0]
           attempt = -1
           continue
+        }
+        if (phase === 1 && egressReturnPath) {
+          // Neither path answered: staying on the one that just failed would
+          // keep the install down for the whole cooldown.
+          egressState.unhealthyUntil[egressState.active] = Date.now() + 30_000
+          egressState.active = egressReturnPath
+          egressState.reason = `both paths refused; back to ${egressReturnPath}`
+          if (res.setHeader) res.setHeader("x-zen-egress", egressState.active)
         }
         fatalGate = true
         break
@@ -3955,8 +4043,9 @@ async function handleSystemone(req, res) {
   let lastStatus = 502
   let switched = false
   let lastRetryAfter = 0
+  let onlyAnonymous = false
   for (let ai = 0; ai < auths.length; ai++) {
-    const auth = auths[ai]
+    const auth = onlyAnonymous ? "Bearer public" : auths[ai]
     let upstreamRes
     try {
       upstreamRes = await egressFetch(systemoneURL(), {
@@ -3971,6 +4060,15 @@ async function handleSystemone(req, res) {
       continue
     }
     noteKeyUsed(auth, upstreamRes.status)
+    // Same as the chat routes: a key's 429 is the shared bucket, so ask the
+    // anonymous tier (which speaks for the exit) instead of the next key.
+    if (upstreamRes.status === 429 && !onlyAnonymous) {
+      const anon = auths.indexOf("Bearer public")
+      if (anon > ai) {
+        ai = anon - 1
+        continue
+      }
+    }
     const text = await upstreamRes.text()
     if (upstreamRes.ok) {
       recordReq(req, `${model || "systemone"} (systemone)`, Date.now() - start, upstreamRes.status)
@@ -3984,15 +4082,16 @@ async function handleSystemone(req, res) {
     }
     lastStatus = upstreamRes.status
     lastRetryAfter = Math.max(lastRetryAfter, parseRetryAfter(upstreamRes.headers.get("retry-after")))
-    // Same rule as the chat routes: a *quota* verdict belongs to the account and
-    // the exit, so try the other path once and never sweep the accounts twice.
-    // A 403 FreeTierError is left to the normal model-level path.
+    // Same rule as the chat routes: a key's quota stops that key; only the
+    // anonymous tier speaks for the exit. A 403 FreeTierError stays model-level.
     const gateKind = config.freeTierFastFail ? gateRefusalKind(lastStatus, lastErr) : ""
     if (gateKind === "quota") {
-      if (!switched && canSwitchEgress()) {
-        noteEgressRefusal(egressState.active, gateKind)
-        switchEgress(`classifier refused on the previous path (${gateKind})`)
+      if (auth === "Bearer public" && !switched && canSwitchEgress()) {
+        const from = egressState.active
+        noteEgressRefusal(from, gateKind)
+        switchEgress(`classifier: anonymous tier refused on ${from} (${gateKind})`)
         switched = true
+        onlyAnonymous = true
         ai = -1
         continue
       }
@@ -4278,6 +4377,7 @@ export {
   switchEgress,
   noteEgressRefusal,
   initEgress,
+  keyBlocks,
   parseList,
   clientIp,
   ipOmit,
