@@ -1880,8 +1880,9 @@ async function handleMessages(req, res) {
         // The shared bucket refuses in short bursts: a single anonymous request
         // that is refused right after a pool sweep often answers 200 a moment
         // later (measured: 3 of 4 simultaneous requests succeeded while the
-        // sequential ones were refused). One short retry, then the verdict.
-        if (auth === "Bearer public" && phase === 0 && !anonRetried && !(egressState.unhealthyUntil[egressState.active] > Date.now())) {
+        // sequential ones were refused). One short retry, always, then the
+        // verdict - it keeps the failure path under 3 seconds either way.
+        if (auth === "Bearer public" && phase === 0 && !anonRetried) {
           anonRetried = true
           await new Promise((r) => setTimeout(r, 700))
           attempt = -1
@@ -1910,7 +1911,7 @@ async function handleMessages(req, res) {
           egressState.unhealthyUntil[egressState.active] = Date.now() + 30_000
           egressState.active = egressReturnPath
           egressState.reason = `both paths refused; back to ${egressReturnPath}`
-          egressState.bothRefusedUntil = Date.now() + 60_000
+          egressState.bothRefusedUntil = Date.now() + 20_000
           if (res.setHeader) res.setHeader("x-zen-egress", egressState.active)
         }
         fatalGate = true
@@ -2225,8 +2226,9 @@ async function handleChat(req, res, responsesRoute = false) {
         // The shared bucket refuses in short bursts: a single anonymous request
         // that is refused right after a pool sweep often answers 200 a moment
         // later (measured: 3 of 4 simultaneous requests succeeded while the
-        // sequential ones were refused). One short retry, then the verdict.
-        if (auth === "Bearer public" && phase === 0 && !anonRetried && !(egressState.unhealthyUntil[egressState.active] > Date.now())) {
+        // sequential ones were refused). One short retry, always, then the
+        // verdict - it keeps the failure path under 3 seconds either way.
+        if (auth === "Bearer public" && phase === 0 && !anonRetried) {
           anonRetried = true
           await new Promise((r) => setTimeout(r, 700))
           attempt = -1
@@ -2255,7 +2257,7 @@ async function handleChat(req, res, responsesRoute = false) {
           egressState.unhealthyUntil[egressState.active] = Date.now() + 30_000
           egressState.active = egressReturnPath
           egressState.reason = `both paths refused; back to ${egressReturnPath}`
-          egressState.bothRefusedUntil = Date.now() + 60_000
+          egressState.bothRefusedUntil = Date.now() + 20_000
           if (res.setHeader) res.setHeader("x-zen-egress", egressState.active)
         }
         fatalGate = true
