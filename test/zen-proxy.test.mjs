@@ -600,6 +600,16 @@ describe("egress selection (direct vs the WARP hop)", () => {
     zp.initEgress()
   })
 
+  test("a path that answers is healthy again immediately", () => {
+    zp.saveConfig({ warpProxy: warp("auto") })
+    zp.initEgress()
+    zp.noteEgressRefusal("direct", "quota")
+    assert.equal(zp.egressStatus().healthy.direct, false)
+    zp.noteEgressSuccess()
+    assert.equal(zp.egressStatus().healthy.direct, true, "a 200 clears the cooldown")
+    assert.equal(zp.canSwitchEgress(), true)
+  })
+
   test("mode always starts on the hop and never switches", () => {
     zp.saveConfig({ warpProxy: warp("always") })
     zp.initEgress()

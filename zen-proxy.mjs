@@ -1380,6 +1380,12 @@ function canSwitchEgress(now = Date.now()) {
   const to = otherEgress(egressState.active)
   return egressUsable(to) && egressState.unhealthyUntil[to] <= now
 }
+// A 200 proves the path works, so the dashboard stops calling it "avoided" and
+// the choice can move again as soon as the other path is worth trying.
+function noteEgressSuccess() {
+  egressState.unhealthyUntil[egressState.active] = 0
+  egressState.bothRefusedUntil = 0
+}
 function egressStatus() {
   const now = Date.now()
   return {
@@ -1811,6 +1817,7 @@ async function handleMessages(req, res) {
       }
 
       if (upstreamRes.ok) {
+        noteEgressSuccess()
         if (isStream) {
           const chunks = format === "responses" ? responsesChunksAsChat(upstreamRes) : sseChunks(upstreamRes)
           // Fire-and-forget: the pump owns every client-visible failure, but
@@ -2122,6 +2129,7 @@ async function handleChat(req, res, responsesRoute = false) {
       }
 
       if (upstreamRes.ok) {
+        noteEgressSuccess()
         if (isStream) {
           if (model !== requested) {
             res.setHeader?.("x-zen-served-by", model)
@@ -4112,6 +4120,7 @@ async function handleSystemone(req, res) {
     }
     const text = await upstreamRes.text()
     if (upstreamRes.ok) {
+      noteEgressSuccess()
       recordReq(req, `${model || "systemone"} (systemone)`, Date.now() - start, upstreamRes.status)
       res.writeHead(200, { "content-type": upstreamRes.headers.get("content-type") ?? "application/json" })
       return res.end(text)
@@ -4417,6 +4426,7 @@ export {
   canSwitchEgress,
   switchEgress,
   noteEgressRefusal,
+  noteEgressSuccess,
   initEgress,
   keyBlocks,
   parseList,
