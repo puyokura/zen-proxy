@@ -93,7 +93,7 @@ $SUDO mkdir -p /etc/systemd/system/zen-proxy.service.d
 sed -e "s|--port 8890|--port ${RELAY_PORT}|" -e "s|--hop http://127.0.0.1:40000|--hop ${HOP}|" \
   "$REPO_DIR/deploy/zen-proxy-warp-relay.service" \
   | $SUDO tee /etc/systemd/system/zen-proxy-warp-relay.service >/dev/null
-sed -e "s|http://127.0.0.1:8890|${RELAY_URL}|g" \
+sed -e "s|http://127.0.0.1:40000|${HOP}|g" \
   "$REPO_DIR/deploy/zen-proxy.service.d/warp-proxy.conf" \
   | $SUDO tee /etc/systemd/system/zen-proxy.service.d/warp-proxy.conf >/dev/null
 

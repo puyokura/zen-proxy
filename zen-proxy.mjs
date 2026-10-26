@@ -347,7 +347,21 @@ const DEFAULT_CONFIG = {
     port: Number(ENV.WARP_PROXY_PORT ?? 8890),
     hop: String(ENV.WARP_PROXY_HOP ?? "").trim(),
     fallback: ENV.WARP_PROXY_FALLBACK ?? "direct",
+    // auto: choose per request and switch when one path is refused.
+    // always: pin the hop. off: never use the hop.
+    mode: String(ENV.WARP_PROXY_MODE ?? "auto").trim().toLowerCase(),
+    // How long a refused path is avoided before it may be tried again.
+    cooldownMs: Number(ENV.WARP_PROXY_COOLDOWN_MS ?? 300000),
   },
+  // A quota/gate refusal is a verdict on the account and the exit, never on the
+  // model: report it after one account sweep (and at most one path switch)
+  // instead of walking the whole catalog. See handleChat.
+  freeTierFastFail: ENV.FREE_TIER_FAST_FAIL !== "0",
+  // The hourly sync exists to prove the gate answers, not to health-check every
+  // model: one probe is enough, and it must not compete with real traffic.
+  // 0 keeps the old "probe everything" behaviour for a deliberate full sweep.
+  syncProbeModels: Number(ENV.SYNC_PROBE_MODELS ?? 1),
+  syncIdleMs: Number(ENV.SYNC_IDLE_MS ?? 120000),
   trustForwarded: ENV.TRUST_FORWARDED === "1",
   timeoutMs: Number(ENV.TIMEOUT_MS ?? 120000),
   cacheMs: Number(ENV.CACHE_MS ?? 30000),
@@ -376,6 +390,10 @@ function loadConfig() {
     merged.warpProxy.hop = String(merged.warpProxy.hop ?? "").trim()
     merged.warpProxy.fallback = merged.warpProxy.fallback === "none" ? "none" : "direct"
     merged.warpProxy.enabled = Boolean(merged.warpProxy.enabled && merged.warpProxy.hop)
+    merged.warpProxy.mode = ["auto", "always", "off"].includes(String(merged.warpProxy.mode ?? "").toLowerCase())
+      ? String(merged.warpProxy.mode).toLowerCase()
+      : "auto"
+    merged.warpProxy.cooldownMs = Math.max(10_000, Number(merged.warpProxy.cooldownMs) || DEFAULT_CONFIG.warpProxy.cooldownMs)
     // A config file that predates the models.json catalog still holds a list
     // written by an older build. Those are only ever subsets of what we shipped
     // (the runtime sync used to prune dead entries and save the result), so
@@ -433,6 +451,7 @@ if (isMain) {
       reloading = true
       setTimeout(() => {
         config = loadConfig()
+        initEgress()
         reloading = false
         scheduleSync()
         scheduleUA()
@@ -1164,7 +1183,7 @@ function num(v, dflt) {
   const n = Number(v)
   return Number.isFinite(n) ? n : dflt
 }
-const syncState = { at: 0, ok: false, running: false, working: [], rateLimited: [], flaky: [], gated: [], dead: [], systemone: [], error: "", ms: 0 }
+const syncState = { at: 0, ok: false, running: false, working: [], rateLimited: [], flaky: [], gated: [], dead: [], systemone: [], error: "", ms: 0, streak: 0 }
 // Health learned from real client traffic, kept alongside the agent-shaped
 // probe in probeModel(). Real traffic is the ground truth: it can disagree
 // with a probe when a gate lifts or a quota refills mid-cycle.
@@ -1187,7 +1206,13 @@ function log(message) {
   console.log(line.msg)
 }
 
+// Last time a client request was answered (not a sync probe). The hourly sync
+// uses it to stay out of the way: probing while a turn is in flight spends the
+// same shared bucket the turn needs.
+let lastTrafficAt = 0
+
 function recordReq(req, model, ms, status, at = Date.now()) {
+  lastTrafficAt = at
   const entry = { at, ip: clientIp(req), model, status, ms }
   const key = `${entry.at}|${entry.model}|${entry.status}`
   if (!requestStats.recent.length || requestStats.recent[requestStats.recent.length - 1][0] !== key) {
@@ -1270,6 +1295,108 @@ function projectHash() {
   if (!cachedProjectHash) cachedProjectHash = createHash("sha1").update(`directory:${process.cwd()}`).digest("hex")
   return cachedProjectHash
 }
+
+// ---- egress selection: direct vs the WARP hop -------------------------------
+// The free tier is bound to the exit address, and which exit works changes over
+// time. Measured on the deployed host in one minute: every call through the WARP
+// exit was refused with `429 FreeUsageLimitError`, while the host's own address
+// answered 200 for twelve requests in a row (and a four-way parallel burst).
+// A process-wide `HTTPS_PROXY` therefore turns a healthy install into a dead one,
+// and the relay's "fall back when the hop is down" cannot help — the hop is up,
+// it is refused.
+//
+// So the path is chosen per request: start on the configured one, and when it
+// answers with a quota/gate refusal, try the *other* path once and keep whichever
+// answered for `warpProxy.cooldownMs`. Node's fetch has no per-request proxy
+// option, so the adaptive path is Bun-only (the free tier is Bun-only too); under
+// Node an env proxy still applies globally.
+const egressState = { active: "direct", unhealthyUntil: { direct: 0, warp: 0 }, switchedAt: 0, reason: "" }
+
+function egressMode() {
+  const m = String(config.warpProxy?.mode ?? "auto").toLowerCase()
+  return m === "always" || m === "off" ? m : "auto"
+}
+function warpUsable() {
+  return Boolean(config.warpProxy?.enabled && config.warpProxy?.hop) && egressMode() !== "off"
+}
+function relayProxyUrl() {
+  return `http://127.0.0.1:${Number(config.warpProxy?.port) || 8890}`
+}
+function egressUsable(path) {
+  return path === "warp" ? warpUsable() : true
+}
+function otherEgress(path) {
+  return path === "warp" ? "direct" : "warp"
+}
+function egressCooldownMs() {
+  return Math.max(10_000, Number(config.warpProxy?.cooldownMs) || 300_000)
+}
+function initEgress() {
+  egressState.active = egressMode() === "always" && warpUsable() ? "warp" : "direct"
+  egressState.switchedAt = Date.now()
+  egressState.reason = egressMode() === "off" ? "hop disabled" : `start on ${egressState.active}`
+}
+function egressFetch(url, init) {
+  const proxy = egressState.active === "warp" ? relayProxyUrl() : null
+  // Bun honours a per-request proxy; Node's fetch would throw on the option, so
+  // there it keeps whatever HTTPS_PROXY the process was started with.
+  if (proxy && typeof Bun !== "undefined") return fetch(url, { ...init, proxy })
+  return fetch(url, init)
+}
+// A refusal the proxy must not retry against other models: the gateway answers
+// the same `FreeUsageLimitError` for a spent shared bucket and for a request it
+// will not tie to an opencode client, and neither is a property of the model.
+function gateRefusalKind(status, body) {
+  if (status !== 429 && status !== 403) return ""
+  const type = String(body?.error?.type ?? body?.type ?? "")
+  const msg = String(body?.error?.message ?? body?.message ?? "")
+  if (/FreeUsageLimit/i.test(type) || /free usage limit/i.test(msg)) return "quota"
+  if (/FreeTierError/i.test(type) || /free tier can only|only be used (from )?within opencode/i.test(msg)) return "gate"
+  return ""
+}
+function noteEgressRefusal(path, why) {
+  egressState.unhealthyUntil[path] = Date.now() + egressCooldownMs()
+  egressState.reason = `${path}: ${why}`
+  log(`egress ${path} refused (${why}) — avoiding it for ${Math.round(egressCooldownMs() / 1000)}s`)
+}
+function switchEgress(why) {
+  const from = egressState.active
+  const to = otherEgress(from)
+  if (!egressUsable(to)) return false
+  egressState.active = to
+  egressState.switchedAt = Date.now()
+  egressState.reason = why
+  log(`egress: ${from} → ${to} (${why})`)
+  return true
+}
+function canSwitchEgress(now = Date.now()) {
+  if (egressMode() !== "auto") return false
+  const to = otherEgress(egressState.active)
+  return egressUsable(to) && egressState.unhealthyUntil[to] <= now
+}
+function egressStatus() {
+  const now = Date.now()
+  return {
+    mode: egressMode(),
+    active: egressState.active,
+    healthy: {
+      direct: egressState.unhealthyUntil.direct <= now,
+      warp: warpUsable() && egressState.unhealthyUntil.warp <= now,
+    },
+    avoidForSec: {
+      direct: Math.max(0, Math.round((egressState.unhealthyUntil.direct - now) / 1000)),
+      warp: Math.max(0, Math.round((egressState.unhealthyUntil.warp - now) / 1000)),
+    },
+    switchedAt: egressState.switchedAt || null,
+    reason: egressState.reason,
+    relay: relayProxyUrl(),
+    adaptive: typeof Bun !== "undefined" && egressMode() === "auto",
+  }
+}
+
+// The configured start path is applied once the egress helpers exist (the
+// config is loaded above, but `egressState` is a const declared in this block).
+initEgress()
 
 function zenHeaders(req, auth) {
   const headers = {
@@ -1547,6 +1674,12 @@ async function handleMessages(req, res) {
   let firstErr = null
   let firstStatus = 0
   let used = requested
+  // Fast-fail state: `phase` 0 = the active path, 1 = the one retry on the other
+  // path; `fatalGate` stops passing the refusal to the next model.
+  let phase = 0
+  let fatalGate = false
+  let lastRetryAfter = 0
+  if (res.setHeader) res.setHeader("x-zen-egress", egressState.active)
   // The model the client chose is tried first; transient failures are retried
   // against that same model before the chain moves on.
   const retries = config.retriesPerModel > 0 ? Math.floor(config.retriesPerModel) : 0
@@ -1585,7 +1718,7 @@ async function handleMessages(req, res) {
       let upstreamRes
       const wall = isStream ? headersWall() : null
       try {
-        upstreamRes = await fetch(`${config.upstream}${format === "responses" ? "/responses" : "/chat/completions"}`, {
+        upstreamRes = await egressFetch(`${config.upstream}${format === "responses" ? "/responses" : "/chat/completions"}`, {
           method: "POST",
           headers: zenHeaders(req, auth),
           body: JSON.stringify(payload),
@@ -1665,6 +1798,28 @@ async function handleMessages(req, res) {
       }
       lastStatus = upstreamRes.status
       const retryAfterMs = Math.min(parseRetryAfter(upstreamRes.headers.get("retry-after")) * 1000, 3000)
+      // A quota refusal is a verdict on the account and the exit, never on this
+      // model. Measured: all eight free models answer 429 in the same minute, so
+      // walking the catalog can only multiply the wait — it used to spend 80
+      // seconds to return a single 429. One path switch, then report it.
+      // A 403 FreeTierError stays model-level (a gated model can fall back to a
+      // working one), so only the quota verdict short-circuits.
+      const gateKind = config.freeTierFastFail ? gateRefusalKind(lastStatus, lastErr) : ""
+      if (gateKind === "quota") {
+        lastRetryAfter = Math.max(lastRetryAfter, parseRetryAfter(upstreamRes.headers.get("retry-after")))
+        if (phase === 0 && canSwitchEgress()) {
+          noteEgressRefusal(egressState.active, gateKind)
+          switchEgress(`all accounts refused on the previous path (${gateKind})`)
+          if (res.setHeader) res.setHeader("x-zen-egress", egressState.active)
+          phase = 1
+          ai = auths.length
+          auth = auths[0]
+          attempt = -1
+          continue
+        }
+        fatalGate = true
+        break
+      }
       if (transientUpstream(upstreamRes.status, lastErr) && attempt < retries) {
         delayMs = Math.max(config.retryBackoffMs * (attempt + 1), retryAfterMs)
         continue
@@ -1682,6 +1837,7 @@ async function handleMessages(req, res) {
       res.end(JSON.stringify(e.body))
       return
     }
+    if (fatalGate) break
     if (chosen && firstErr == null) {
       firstErr = lastErr
       firstStatus = lastStatus
@@ -1695,7 +1851,10 @@ async function handleMessages(req, res) {
   const finalStatus = firstErr ? firstStatus : lastStatus
   recordReq(req, requested, Date.now() - start, finalStatus)
   const e = anthropicError(finalStatus, finalErr ?? { error: { type: "api_error", message: "all free models are unavailable" } })
-  res.writeHead(e.status, { "content-type": "application/json" })
+  res.writeHead(e.status, {
+    "content-type": "application/json",
+    ...(lastRetryAfter > 0 ? { "retry-after": String(Math.ceil(lastRetryAfter)) } : {}),
+  })
   res.end(JSON.stringify(e.body))
 }
 
@@ -1753,6 +1912,12 @@ async function handleChat(req, res, responsesRoute = false) {
   let firstErr = null
   let firstStatus = 0
   let used = requested
+  // Fast-fail state: `phase` 0 = the active path, 1 = the one retry on the other
+  // path; `fatalGate` stops the catalog walk once the gate has said no.
+  let phase = 0
+  let fatalGate = false
+  let lastRetryAfter = 0
+  if (res.setHeader) res.setHeader("x-zen-egress", egressState.active)
   // The model the client chose is tried first; transient failures are retried
   // against that same model before the chain moves on.
   const retries = config.retriesPerModel > 0 ? Math.floor(config.retriesPerModel) : 0
@@ -1823,7 +1988,7 @@ async function handleChat(req, res, responsesRoute = false) {
       let upstreamRes
       const wall = isStream ? headersWall() : null
       try {
-        upstreamRes = await fetch(`${config.upstream}${format === "responses" ? "/responses" : "/chat/completions"}`, {
+        upstreamRes = await egressFetch(`${config.upstream}${format === "responses" ? "/responses" : "/chat/completions"}`, {
           method: "POST",
           headers: zenHeaders(req, auth),
           body: JSON.stringify(payload),
@@ -1937,6 +2102,28 @@ async function handleChat(req, res, responsesRoute = false) {
       }
       lastStatus = upstreamRes.status
       const retryAfterMs = Math.min(parseRetryAfter(upstreamRes.headers.get("retry-after")) * 1000, 3000)
+      // A quota refusal is a verdict on the account and the exit, never on this
+      // model. Measured: all eight free models answer 429 in the same minute, so
+      // walking the catalog can only multiply the wait — it used to spend 80
+      // seconds to return a single 429. One path switch, then report it.
+      // A 403 FreeTierError stays model-level (a gated model can fall back to a
+      // working one), so only the quota verdict short-circuits.
+      const gateKind = config.freeTierFastFail ? gateRefusalKind(lastStatus, lastErr) : ""
+      if (gateKind === "quota") {
+        lastRetryAfter = Math.max(lastRetryAfter, parseRetryAfter(upstreamRes.headers.get("retry-after")))
+        if (phase === 0 && canSwitchEgress()) {
+          noteEgressRefusal(egressState.active, gateKind)
+          switchEgress(`all accounts refused on the previous path (${gateKind})`)
+          if (res.setHeader) res.setHeader("x-zen-egress", egressState.active)
+          phase = 1
+          ai = auths.length
+          auth = auths[0]
+          attempt = -1
+          continue
+        }
+        fatalGate = true
+        break
+      }
       if (transientUpstream(upstreamRes.status, lastErr) && attempt < retries) {
         delayMs = Math.max(config.retryBackoffMs * (attempt + 1), retryAfterMs)
         continue
@@ -1957,6 +2144,7 @@ async function handleChat(req, res, responsesRoute = false) {
       res.end(JSON.stringify(lastErr))
       return
     }
+    if (fatalGate) break
     if (chosen && firstErr == null) {
       firstErr = lastErr
       firstStatus = lastStatus
@@ -1972,7 +2160,10 @@ async function handleChat(req, res, responsesRoute = false) {
   // tried is an implementation detail and used to read as "another model
   // answered" while the error shown actually came from the requested one.
   recordReq(req, requested, Date.now() - start, finalStatus)
-  res.writeHead(finalStatus, { "content-type": "application/json" })
+  res.writeHead(finalStatus, {
+    "content-type": "application/json",
+    ...(lastRetryAfter > 0 ? { "retry-after": String(Math.ceil(lastRetryAfter)) } : {}),
+  })
   res.end(
     JSON.stringify(finalErr ?? { error: { type: "free_usage_limit_error", message: "all free models are rate-limited" } }),
   )
@@ -2657,7 +2848,7 @@ async function probeModel(id, auth, session) {
     headers["x-session-id"] = session
   }
   if (config.tracing) for (const [k, v] of Object.entries(traceHeaders())) headers[k] = v
-  const r = await fetch(`${config.upstream}${format === "responses" ? "/responses" : "/chat/completions"}`, {
+  const r = await egressFetch(`${config.upstream}${format === "responses" ? "/responses" : "/chat/completions"}`, {
     method: "POST",
     headers,
     body: JSON.stringify(agentProbePayload(id, format)),
@@ -3133,7 +3324,7 @@ async function fetchModels() {
   if (modelsFetching) return modelsFetching
   modelsFetching = (async () => {
     try {
-      const res = await fetch(`${MODEL_LIST_BASE}/models`, {
+      const res = await egressFetch(`${MODEL_LIST_BASE}/models`, {
         headers: { "user-agent": config.ua },
         signal: AbortSignal.timeout(15_000),
       })
@@ -3173,11 +3364,19 @@ async function fetchModels() {
 
 async function syncModels() {
   if (syncState.running) return syncState
+  // Real traffic first: a probe is worth nothing if it costs the user a turn.
+  // The gate's bucket is shared, and the old every-model sweep both spent it and
+  // reported the resulting 429s as "all models rate-limited".
+  const idleFor = Date.now() - lastTrafficAt
+  if (config.syncIdleMs > 0 && lastTrafficAt > 0 && idleFor < config.syncIdleMs) {
+    log(`auto-sync skipped: traffic ${Math.round(idleFor / 1000)}s ago (wait ${Math.round(config.syncIdleMs / 1000)}s)`)
+    return { ...syncState, skipped: "busy" }
+  }
   syncState.running = true
   syncState.at = Date.now()
   const start = Date.now()
   try {
-    const res = await fetch(`${MODEL_LIST_BASE}/models`, {
+    const res = await egressFetch(`${MODEL_LIST_BASE}/models`, {
       headers: { "user-agent": config.ua },
       signal: AbortSignal.timeout(15_000),
     })
@@ -3204,6 +3403,12 @@ async function syncModels() {
     const removeFromCurrent = new Set()
     const auth = probeAuthHeader()
     let idx = 0
+    let probed = 0
+    // One probe is the default: it answers "does the gate still accept this
+    // install", which is all the dashboard needs. Health of the other models is
+    // learned from real traffic (recordObserved), not from spending the bucket.
+    const rawLimit = Number(config.syncProbeModels)
+    const probeLimit = Number.isFinite(rawLimit) && rawLimit > 0 ? Math.floor(rawLimit) : candidates.length
     // Probes run serially with a beat between hops. The gate blanket-403s a
     // rapid model-hop burst from one identity: with 3 concurrent workers the
     // identical request shape that streams 200 one-at-a-time landed all 8
@@ -3220,6 +3425,8 @@ async function syncModels() {
           systemone.push(id)
           continue
         }
+        if (probed >= probeLimit) break
+        probed++
         try {
           const r = await probeModel(id, auth, sessionHeader())
           let bodyErr = ""
@@ -3319,6 +3526,10 @@ async function syncModels() {
     syncState.systemone = systemone
     syncState.error = ""
     syncState.ok = true
+    // Consecutive sweeps where the probe was refused and nothing answered: the
+    // bucket is spent, so back off instead of re-probing on the hour.
+    const probedCount = working.length + rateLimited.length + gated.length + flaky.length + dead.length
+    syncState.streak = probedCount > 0 && working.length === 0 && rateLimited.length > 0 ? (syncState.streak ?? 0) + 1 : 0
     modelsCache = { at: 0, data: [], ok: true }
   } catch (err) {
     syncState.ok = false
@@ -3360,10 +3571,14 @@ let syncTimer = null
 function scheduleSync() {
   if (syncTimer) clearTimeout(syncTimer)
   if (!config.autoSync || config.autoSyncIntervalMs <= 0) return
+  // A refused probe means the shared bucket is spent, not that the models are
+  // broken: stretch the interval (up to 6h) until a sweep answers again.
+  const factor = Math.min(2 ** Math.min(syncState.streak ?? 0, 3), 8)
+  const delay = Math.min(config.autoSyncIntervalMs * factor, 6 * 3600_000)
   syncTimer = setTimeout(async () => {
     await syncModels()
     scheduleSync()
-  }, config.autoSyncIntervalMs)
+  }, delay)
   if (syncTimer.unref) syncTimer.unref()
 }
 
@@ -3465,6 +3680,9 @@ async function handleApiConfig(req, res) {
       cleaned.autoSync = toBool(cleaned.autoSync, config.autoSync)
       cleaned.autoUA = toBool(cleaned.autoUA, config.autoUA)
       cleaned.injectSession = toBool(cleaned.injectSession, config.injectSession)
+      cleaned.freeTierFastFail = toBool(cleaned.freeTierFastFail, config.freeTierFastFail)
+      cleaned.syncProbeModels = Math.max(1, Math.min(20, num(cleaned.syncProbeModels ?? config.syncProbeModels, config.syncProbeModels)))
+      cleaned.syncIdleMs = Math.max(0, num(cleaned.syncIdleMs ?? config.syncIdleMs, config.syncIdleMs))
       cleaned.tracing = toBool(cleaned.tracing, config.tracing)
       // These two ride out as request headers, so keep them to token characters:
       // a config typo must never be able to inject a header.
@@ -3496,6 +3714,10 @@ async function handleApiConfig(req, res) {
         hop: String(incomingWarp.hop ?? config.warpProxy?.hop ?? "").trim(),
         port: Number(incomingWarp.port ?? config.warpProxy?.port) || DEFAULT_CONFIG.warpProxy.port,
         fallback: incomingWarp.fallback === "none" ? "none" : "direct",
+        mode: ["auto", "always", "off"].includes(String(incomingWarp.mode ?? config.warpProxy?.mode ?? "").toLowerCase())
+          ? String(incomingWarp.mode ?? config.warpProxy?.mode).toLowerCase()
+          : "auto",
+        cooldownMs: Math.max(10_000, Number(incomingWarp.cooldownMs ?? config.warpProxy?.cooldownMs) || DEFAULT_CONFIG.warpProxy.cooldownMs),
       }
       cleaned.warpProxy.enabled = Boolean(cleaned.warpProxy.enabled && cleaned.warpProxy.hop)
       const warpChanged = JSON.stringify(cleaned.warpProxy) !== JSON.stringify(config.warpProxy)
@@ -3511,7 +3733,12 @@ async function handleApiConfig(req, res) {
       scheduleSync()
       scheduleUA()
       log("config updated via UI")
-      if (warpChanged) log("proxy hop settings changed — restart zen-proxy to apply them")
+      if (warpChanged) {
+        // The path is chosen per request now, so a mode change applies at once;
+        // only hop/port changes wait for a restart (the relay owns those).
+        initEgress()
+        log("proxy hop settings changed - egress re-evaluated; restart if the hop address or port moved")
+      }
       return json(res, 200, { config: sanitize(config) })
     } catch (err) {
       if (err && err.statusCode === 413) {
@@ -3550,6 +3777,7 @@ async function handleStatus(req, res) {
   json(res, 200, {
     uptime: Math.floor(process.uptime()),
     runtime: runtimeInfo(),
+    egress: egressStatus(),
     upstreamOk: cache.ok,
     upstream: config.upstream,
     ua: config.ua,
@@ -3611,7 +3839,7 @@ async function handleTest(req, res) {
         : (authForUpstream(req) ?? "Bearer public")
     const systemone = isSystemoneOnly(model)
     const format = systemone ? "systemone" : modelFormat(model)
-    const upstreamRes = await fetch(systemone ? systemoneURL() : `${config.upstream}${format === "responses" ? "/responses" : "/chat/completions"}`, {
+    const upstreamRes = await egressFetch(systemone ? systemoneURL() : `${config.upstream}${format === "responses" ? "/responses" : "/chat/completions"}`, {
       method: "POST",
       headers: (() => {
         const h = {
@@ -3725,11 +3953,13 @@ async function handleSystemone(req, res) {
 
   let lastErr = null
   let lastStatus = 502
+  let switched = false
+  let lastRetryAfter = 0
   for (let ai = 0; ai < auths.length; ai++) {
     const auth = auths[ai]
     let upstreamRes
     try {
-      upstreamRes = await fetch(systemoneURL(), {
+      upstreamRes = await egressFetch(systemoneURL(), {
         method: "POST",
         headers: zenHeaders(req, auth),
         body: raw,
@@ -3753,6 +3983,21 @@ async function handleSystemone(req, res) {
       lastErr = { error: { type: "upstream_error", message: `upstream returned ${upstreamRes.status}` } }
     }
     lastStatus = upstreamRes.status
+    lastRetryAfter = Math.max(lastRetryAfter, parseRetryAfter(upstreamRes.headers.get("retry-after")))
+    // Same rule as the chat routes: a *quota* verdict belongs to the account and
+    // the exit, so try the other path once and never sweep the accounts twice.
+    // A 403 FreeTierError is left to the normal model-level path.
+    const gateKind = config.freeTierFastFail ? gateRefusalKind(lastStatus, lastErr) : ""
+    if (gateKind === "quota") {
+      if (!switched && canSwitchEgress()) {
+        noteEgressRefusal(egressState.active, gateKind)
+        switchEgress(`classifier refused on the previous path (${gateKind})`)
+        switched = true
+        ai = -1
+        continue
+      }
+      break
+    }
     if (keyRotationWorthy(upstreamRes.status, lastErr) && ai + 1 < auths.length) {
       log(`${keyLabel(auth)} rejected (${upstreamRes.status}) — retrying systemone on the next account`)
       continue
@@ -3760,7 +4005,10 @@ async function handleSystemone(req, res) {
     break
   }
   recordReq(req, `${model || "systemone"} (systemone)`, Date.now() - start, lastStatus)
-  res.writeHead(lastStatus, { "content-type": "application/json" })
+  res.writeHead(lastStatus, {
+    "content-type": "application/json",
+    ...(lastRetryAfter > 0 ? { "retry-after": String(Math.ceil(lastRetryAfter)) } : {}),
+  })
   res.end(JSON.stringify(lastErr ?? { error: { type: "api_error", message: "systemone upstream unavailable" } }))
 }
 
@@ -3950,14 +4198,16 @@ if (isMain) {
       log("   Bun instead:  bun zen-proxy.mjs   (see README)")
       log("")
     }
-    if (config.warpProxy?.enabled && config.warpProxy.hop) {
-      const relayUrl = `http://127.0.0.1:${config.warpProxy.port}`
-      const proxyEnv = String(process.env.HTTPS_PROXY || process.env.HTTP_PROXY || "")
-      if (proxyEnv !== relayUrl) {
-        log(`proxy hop ${config.warpProxy.hop} is configured, but HTTPS_PROXY does not point at ${relayUrl} (${proxyEnv || "not set"}) — the upstream calls stay direct`)
-      } else {
-        log(`proxy hop ${config.warpProxy.hop} via relay ${relayUrl} (fallback ${config.warpProxy.fallback})`)
-      }
+    // Egress: the path is chosen per request, so an env proxy in the unit would
+    // silently pin every call again — say so instead of looking adaptive.
+    const status = egressStatus()
+    if (status.mode === "off") log("egress: direct only (hop disabled)")
+    else if (!warpUsable()) log(`egress: ${status.active} (no hop configured)`)
+    else log(`egress: ${status.active} of direct|warp (mode ${status.mode}, relay ${status.relay})`)
+    const proxyEnv = String(process.env.HTTPS_PROXY || process.env.HTTP_PROXY || "")
+    if (proxyEnv) {
+      log(`WARNING: ${proxyEnv} is set in this process - every upstream call uses it regardless of the egress choice.`)
+      log("         Remove HTTPS_PROXY/HTTP_PROXY from the service unit to let zen-proxy pick the path.")
     }
     if (!fs.existsSync(CONFIG_PATH)) {
       try {
@@ -4016,6 +4266,18 @@ export {
   systemoneURL,
   handleSystemone,
   relayStatus,
+  // egress selection (direct vs the WARP hop)
+  egressState,
+  egressMode,
+  egressStatus,
+  egressFetch,
+  egressUsable,
+  warpUsable,
+  gateRefusalKind,
+  canSwitchEgress,
+  switchEgress,
+  noteEgressRefusal,
+  initEgress,
   parseList,
   clientIp,
   ipOmit,

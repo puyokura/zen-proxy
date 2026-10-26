@@ -161,9 +161,11 @@ function snapshotConfig() {
 let originalConfig
 beforeEach(() => {
   globalThis.fetch = originalFetch
-  if (originalConfig) zp.saveConfig(originalConfig)
+  // The suite exercises the per-model classification, so it asks for a full
+  // sweep; the shipped default is one probe (see syncProbeModels).
+  if (originalConfig) zp.saveConfig({ ...originalConfig, syncProbeModels: 0, syncIdleMs: 0 })
   Object.assign(zp.requestStats, { total: 0, errors: 0, recent: [], perMinute: new Map(), window60: [] })
-  Object.assign(zp.syncState, { at: 0, ok: false, running: false, ms: 0, working: [], rateLimited: [], flaky: [], gated: [], systemone: [], dead: [], error: "" })
+  Object.assign(zp.syncState, { at: 0, ok: false, running: false, ms: 0, working: [], rateLimited: [], flaky: [], gated: [], systemone: [], dead: [], error: "", streak: 0 })
 })
 beforeEach(() => {
   originalConfig = snapshotConfig()
@@ -566,6 +568,82 @@ describe("v2 wire identity (the gate reads more than the session pair)", () => {
     assert.equal(rt.name, "node")
     assert.equal(rt.bun, false)
     assert.equal(typeof rt.version, "string")
+  })
+})
+
+describe("egress selection (direct vs the WARP hop)", () => {
+  const warp = (mode = "auto") => ({ enabled: true, hop: "http://127.0.0.1:40000", mode, port: 8890, fallback: "direct" })
+
+  test("a quota refusal is recognised; an ordinary rate limit is not", () => {
+    assert.equal(zp.gateRefusalKind(429, { error: { type: "FreeUsageLimitError", message: "Free usage limit reached." } }), "quota")
+    assert.equal(zp.gateRefusalKind(403, { error: { type: "FreeTierError", message: "free tier can only be used from within OpenCode" } }), "gate")
+    assert.equal(zp.gateRefusalKind(429, { error: { message: "rate limited" } }), "", "a plain 429 stays retryable")
+    assert.equal(zp.gateRefusalKind(500, { error: { type: "FreeUsageLimitError" } }), "")
+  })
+
+  test("a refused path is avoided and the other one takes over", () => {
+    zp.saveConfig({ warpProxy: warp("auto") })
+    zp.initEgress()
+    assert.equal(zp.egressStatus().active, "direct", "auto starts on the host's own address")
+    assert.equal(zp.canSwitchEgress(), true)
+    zp.noteEgressRefusal("direct", "quota")
+    assert.equal(zp.egressStatus().healthy.direct, false)
+    assert.equal(zp.switchEgress("refused"), true)
+    assert.equal(zp.egressStatus().active, "warp")
+    assert.equal(zp.canSwitchEgress(), false, "the hop is active and healthy, so there is nothing to switch to")
+    zp.saveConfig({ warpProxy: warp("auto") })
+    zp.initEgress()
+  })
+
+  test("mode always starts on the hop and never switches", () => {
+    zp.saveConfig({ warpProxy: warp("always") })
+    zp.initEgress()
+    assert.equal(zp.egressStatus().active, "warp")
+    assert.equal(zp.canSwitchEgress(), false)
+    zp.saveConfig({ warpProxy: warp("auto") })
+    zp.initEgress()
+  })
+
+  test("mode off leaves the hop out of the choice", () => {
+    zp.saveConfig({ warpProxy: warp("off") })
+    zp.initEgress()
+    const st = zp.egressStatus()
+    assert.equal(st.active, "direct")
+    assert.equal(st.healthy.warp, false)
+    assert.equal(zp.canSwitchEgress(), false)
+    zp.saveConfig({ warpProxy: warp("auto") })
+    zp.initEgress()
+  })
+
+  test("sync stays quiet while a client is being served", async () => {
+    zp.saveConfig({ autoSyncIntervalMs: 0, syncIdleMs: 120000, syncProbeModels: 1, cacheMs: 0 })
+    zp.recordReq(mockReq(), "recent", 1, 200)
+    const r = await zp.syncModels()
+    assert.equal(r.skipped, "busy")
+    zp.saveConfig({ syncIdleMs: 0 })
+  })
+
+  test("sync probes one model by default, not the whole catalog", async () => {
+    zp.saveConfig({
+      autoSyncIntervalMs: 0,
+      syncIdleMs: 0,
+      syncProbeModels: 1,
+      cacheMs: 0,
+      fallbackModels: ["alpha-free", "beta-free", "gamma-free"],
+    })
+    let probes = 0
+    globalThis.fetch = routeFetch([
+      ["/models", () => jsonResponse({ data: [{ id: "alpha-free" }, { id: "beta-free" }, { id: "gamma-free" }] })],
+      [
+        "/chat/completions",
+        () => {
+          probes++
+          return sseResponse(["OK1"])
+        },
+      ],
+    ])
+    await zp.syncModels()
+    assert.equal(probes, 1)
   })
 })
 
@@ -1787,7 +1865,7 @@ describe("handleChat", () => {
     assert.match(res.body, /FreeUsageLimitError/)
   })
 
-  test("free usage limit walks the chain instead of stopping at one model", async () => {
+  test("free usage limit fails fast instead of walking the catalog", async () => {
     zp.saveConfig({
       defaultZenKey: "",
       zenKeys: ["key-a", "key-b"],
@@ -1798,7 +1876,10 @@ describe("handleChat", () => {
       defaultModel: "",
       autoSyncIntervalMs: 0,
       cacheMs: 0,
+      syncIdleMs: 0,
+      warpProxy: { enabled: true, hop: "http://127.0.0.1:40000", mode: "auto", port: 8890, fallback: "direct" },
     })
+    zp.initEgress()
     const calls = []
     globalThis.fetch = routeFetch([
       [
@@ -1808,24 +1889,27 @@ describe("handleChat", () => {
           return jsonResponse(
             { type: "error", error: { type: "FreeUsageLimitError", message: "Free usage limit reached. Subscribe to OpenCode Go to keep going." } },
             429,
+            { "retry-after": "30" },
           )
         },
       ],
     ])
     const req = mockReq({ _body: JSON.stringify({ model: "space-bunny-free", messages: [] }) })
     const res = mockRes()
+    const started = Date.now()
     await zp.handleChat(req, res)
     assert.equal(res.state.status, 429)
     assert.match(res.body, /FreeUsageLimitError/)
-    // The 429 payload is also what the v2 gate answers for a refused request, so
-    // it cannot be read as "every model is dry": the chain still visits the next
-    // model. Every account is tried first on the requested model (two keys plus
-    // the anonymous tier), then retriesPerModel gives it two more attempts.
-    assert.equal(calls.filter((m) => m === "space-bunny-free").length, 5)
-    assert.ok(calls.includes("mimo-v2.5-free"), "the next model is still tried")
+    // The refusal is a verdict on the account and the exit, not on the model:
+    // two keys plus the anonymous tier, then exactly one retry on the other path.
+    assert.equal(calls.length, 4, `upstream calls: ${calls.length}`)
+    assert.deepEqual([...new Set(calls)], ["space-bunny-free"], "the catalog is not walked")
+    assert.equal(res.state.headers["retry-after"], "30", "the upstream retry-after is passed through")
+    assert.equal(zp.egressStatus().active, "warp", "the refused path was swapped")
+    assert.ok(Date.now() - started < 3000, "a refused turn must not take 80 seconds")
   })
 
-  test("free usage limit walks the Anthropic chain too", async () => {
+  test("free usage limit fails fast on the Anthropic path too", async () => {
     zp.saveConfig({
       defaultZenKey: "",
       zenKeys: ["key-a", "key-b"],
@@ -1836,7 +1920,10 @@ describe("handleChat", () => {
       defaultModel: "",
       autoSyncIntervalMs: 0,
       cacheMs: 0,
+      syncIdleMs: 0,
+      warpProxy: { enabled: true, hop: "http://127.0.0.1:40000", mode: "auto", port: 8890, fallback: "direct" },
     })
+    zp.initEgress()
     const calls = []
     globalThis.fetch = routeFetch([
       [
@@ -1854,9 +1941,8 @@ describe("handleChat", () => {
     await zp.handleMessages(req, res)
     assert.equal(res.state.status, 429)
     assert.match(res.body, /rate_limit_error/)
-    // Same shape as the chat path: every account, then the per-model retries.
-    assert.equal(calls.filter((m) => m === "space-bunny-free").length, 5)
-    assert.ok(calls.includes("mimo-v2.5-free"), "the next model is still tried")
+    assert.equal(calls.length, 4)
+    assert.deepEqual([...new Set(calls)], ["space-bunny-free"], "the catalog is not walked")
   })
 
   test("non-retryable 400 propagates its status, not 429", async () => {

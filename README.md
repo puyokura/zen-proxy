@@ -33,15 +33,16 @@
 
 ## このフォークについて
 
-[12errh/zen-proxy](https://github.com/12errh/zen-proxy) のフォークです。`upstream/main` を追従しているので、上流の更新は `git pull` だけで取り込めます。上流の挙動はそのままに、次の5つを足しています。
+[12errh/zen-proxy](https://github.com/12errh/zen-proxy) のフォークです。`upstream/main` を追従しているので、上流の更新は `git pull` だけで取り込めます。上流の挙動はそのままに、次のものを足しています。
 
 | 独自要素 | 何をするか |
 |---|---|
 | **複数アカウントのプール** | `zenKeys`、または `zenKeysFile` の `zenKeysRefs` に並べた `refs:` 名（例: `~/.dsh/.credentials.yaml`）を1つのプールとして使います。リクエストは次のアカウントから順に始まり、`401`/`429` が返ると次のアカウントへ渡し、最後の受け皿は匿名枠です。`/api/status` にプールと各アカウントの利用数（マスク済み）が出ます。 |
 | **System One 分類器** | `POST /v1/systemone` が `jev-*` のリクエストをそのまま中継します。`jev-*` は `/v1/models` にも並び、チャット系のルートへ投げると `/v1/systemone` を案内する `400` を返します。上流 URL は共有の `/inference` ルートから組み立てるので、v2 のベースでも旧 `/inference/v1`・`/zen/v1` でも動きます。 |
-| **Cloudflare WARP 経由** | `deploy/install-warp.sh` で上流への通信を WARP の先へ出します。中継は `scripts/warp-relay.mjs` で、WARP が落ちているときは直接接続へ切り替わります（[WARP](#warp)）。 |
-| **実行環境と v2 wire の可視化** | `/api/status` が `runtime`（`bun 1.4.4` / `node …`）を返し、設定タブがホップ情報と並べて表示します。ゲートが実際に見る値——preamble モード（`auto` / `off` / 任意テキスト）、`x-opencode-client`、project hash、`b3`/`traceparent`——も同じ画面で変えられます。`node` で動いているときは「free tier needs bun」と出るので、劣化した状態が枠切れに見えません。 |
-| **429 で止まらない** | 枠切れとゲートの拒否は同じ `429 FreeUsageLimitError` を返すため、区別できません。そこで止めず、次のアカウント → 次のモデルと進み、それでも駄目なときだけ上流のエラーを返します。プローブが踏んだ場合は `rate-limited` 扱いで `dead` にはしないので、混雑した時間帯にモデル一覧が空になりません。 |
+| **経路の自動選択（direct ⇄ WARP）** | 上流への経路を**リクエスト毎に**選びます。片方が `FreeUsageLimitError` を返したら、同じリクエストをもう一方の経路で1回だけ試し、通った方を `cooldownMs` のあいだ使い続けます。プロセス全体を `HTTPS_PROXY` で縛らないので、出口の枯渇で全滅しません（[WARP](#warp)）。 |
+| **429 は即座に返す** | `FreeUsageLimitError` はアカウントと出口の判定で、モデルの問題ではありません（実測: 8モデルが同時に429）。アカウントを一巡し、経路を1回切り替え、それでも駄目なら**3秒以内**に上流の429と `retry-after` を返します。カタログは歩きません（以前は1ターンに最大40回叩いて80秒かけていました）。 |
+| **同期は枠を食わない** | プローブは1モデルだけ。直近 `syncIdleMs`（既定2分）に実リクエストがあればスキップし、429が続いたら間隔を倍に（最大6時間）。プローブが429を踏んでもモデルを `dead` にしません。 |
+| **実行環境と v2 wire の可視化** | `/api/status` が `runtime`（`bun 1.4.4` / `node …`）と `egress`（いまどちらの経路か、どちらが拒否されているか）を返し、設定タブに表示します。ゲートが実際に見る値——preamble モード（`auto` / `off` / 任意テキスト）、`x-opencode-client`、project hash、`b3`/`traceparent`——も同じ画面で変えられます。`node` で動いているときは「free tier needs bun」と出ます。 |
 
 それ以外は上流どおりです。`models.json`、インストーラ、model-sync ワークフローも含みます。
 
@@ -195,10 +196,12 @@ zen-proxy はそのゲートウェイの手前に立ち、エージェントの�
 | `rateLimitMax` / `rateLimitWindowMs` | `0`（無効） / `60000` | クライアント単位のレート制限 |
 | `timeoutMs` / `cacheMs` | `120000` / `30000` | 上流のタイムアウト、`/v1/models` のキャッシュ TTL |
 | `autoSync` / `autoSyncIntervalMs` | `true` / `3600000` | 新しく出た無料モデルの実行時ディスカバリ |
+| `syncProbeModels` / `syncIdleMs` | `1` / `120000` | 同期でプローブするモデル数（`0` で全件）と、実リクエストからこの時間は同期を走らせない間隔 |
+| `freeTierFastFail` | `true` | `FreeUsageLimitError` / `FreeTierError` を「モデルの失敗」ではなく「アカウントと出口の判定」として扱い、カタログを歩かず即返す |
 | `trustForwarded` | `false` | リバースプロキシ配下で `x-forwarded-for` を信頼する |
-| `warpProxy` | `{ "enabled": false, "port": 8890, "hop": "", "fallback": "direct" }` | 上流への通信を、HTTP CONNECT プロキシ経由でトンネルするローカル中継に通します（Cloudflare WARP のプロキシモード、または任意の CONNECT プロキシ）。中継はホップが落ちていれば直接ソケットに切り替わります。[WARP](#warp) を参照 |
+| `warpProxy` | `{ "enabled": false, "port": 8890, "hop": "", "fallback": "direct", "mode": "auto", "cooldownMs": 300000 }` | 2つ目の出口（HTTP CONNECT プロキシ。Cloudflare WARP のプロキシモードなど）。`mode` は `auto`（direct から始めて拒否されたら切替）/ `always`（固定）/ `off`。`cooldownMs` は拒否した経路を避ける時間。[WARP](#warp) を参照 |
 
-`HOST` `PORT` `ZEN_URL` `ZEN_UA` `ZEN_CLIENT` `ZEN_PROJECT_HASH` `ZEN_TRACING=0` `INJECT_SESSION=0` `AUTO_UA=0` `UA_REFRESH_MS` `AGENT_TOOLS=0` `AGENT_PREAMBLE=off` `ZEN_PROXY_AGENT_TOOLS` `ZEN_PROXY_AGENT_PREAMBLE` `PROBE_AUTH` `DEFAULT_MODEL` `FALLBACK_MODELS` `MODEL_ALIASES` `RESPONSES_MODELS` `PROXY_KEY` `ZEN_KEY` `ZEN_KEYS` `ZEN_KEYS_FILE` `ZEN_KEYS_REFS` `TRUST_FORWARDED=1` `TIMEOUT_MS` `CACHE_MS` `RATE_LIMIT_MAX` `RATE_LIMIT_WINDOW_MS` `AUTO_SYNC=0` `AUTO_SYNC_MS` `WARP_PROXY_ENABLED=0` `WARP_PROXY_PORT` `WARP_PROXY_HOP` `WARP_PROXY_FALLBACK` `ZEN_PROXY_CONFIG`
+`HOST` `PORT` `ZEN_URL` `ZEN_UA` `ZEN_CLIENT` `ZEN_PROJECT_HASH` `ZEN_TRACING=0` `INJECT_SESSION=0` `AUTO_UA=0` `UA_REFRESH_MS` `AGENT_TOOLS=0` `AGENT_PREAMBLE=off` `ZEN_PROXY_AGENT_TOOLS` `ZEN_PROXY_AGENT_PREAMBLE` `PROBE_AUTH` `DEFAULT_MODEL` `FALLBACK_MODELS` `MODEL_ALIASES` `RESPONSES_MODELS` `PROXY_KEY` `ZEN_KEY` `ZEN_KEYS` `ZEN_KEYS_FILE` `ZEN_KEYS_REFS` `TRUST_FORWARDED=1` `TIMEOUT_MS` `CACHE_MS` `RATE_LIMIT_MAX` `RATE_LIMIT_WINDOW_MS` `AUTO_SYNC=0` `AUTO_SYNC_MS` `SYNC_PROBE_MODELS` `SYNC_IDLE_MS` `FREE_TIER_FAST_FAIL=0` `WARP_PROXY_ENABLED=0` `WARP_PROXY_PORT` `WARP_PROXY_HOP` `WARP_PROXY_FALLBACK` `WARP_PROXY_MODE` `WARP_PROXY_COOLDOWN_MS` `ZEN_PROXY_CONFIG`
 
 匿名の `public` アクセスは IP 単位の枠を共有していて、混雑することがあります。安定させたいなら `defaultZenKey` を設定するか、リクエスト毎に `x-zen-key` を送ってください。複数アカウント（`zenKeys`、または `zenKeysFile` の refs）を設定すると順番に使われるので、1アカウントあたりの枠が上限ではなくなります。`/api/status` にプールと各アカウントの利用数（マスク済み）が出ます。
 </details>
@@ -270,14 +273,20 @@ echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc      # 永続化
 
 ## WARP
 
-上流への通信を [Cloudflare WARP](https://developers.cloudflare.com/cloudflare-one/team-and-resources/devices/cloudflare-one-client/download/) の先へ出します。話に出る理由は2つ。無料枠が出口アドレスに紐づくこと、共有・ブロック済みの出口は問答無用で拒否されることです。後者のとき上流は `FreeTierError: free models aren't available from your current network because we've detected abusive traffic from this IP address` を返します。
+[Cloudflare WARP](https://developers.cloudflare.com/cloudflare-one/team-and-resources/devices/cloudflare-one-client/download/) を **2つ目の出口** として使います。無料枠は出口アドレスに紐づくので、自分の回線の出口が混雑・ブロックされると `FreeTierError: … abusive traffic from this IP address` や `FreeUsageLimitError` が返ります。そのときの逃げ道が WARP です。
 
-ホップは HTTP CONNECT プロキシです。Cloudflare WARP のプロキシモードは `127.0.0.1:40000` で喋り、他の CONNECT プロキシも同じです。そこへは小さな中継 `scripts/warp-relay.mjs` を介します。Node の環境変数プロキシにはフェイルオーバーが無く、中継が無いと WARP が止まった瞬間に上流への通信が全滅するためです。中継はトンネルをホップ経由で開き、ホップに届かなければ直接ソケットに切り替えるので、どちらでもプロキシは使えます。
+ただし**固定してはいけません**。実測では、WARP の出口が全リクエストに `429 FreeUsageLimitError` を返しているあいだ、ホスト自身の出口は12連続で `200` を返しました。逆に以前は自分の出口が拒否され、WARP だけが通っていました。どちらが生きているかは数分で入れ替わるため、zen-proxy は**リクエスト毎に経路を選びます**。
+
+- `warpProxy.mode: "auto"`（既定）— direct から始め、`FreeUsageLimitError` / `FreeTierError` が返ったら同じリクエストをもう一方の経路で1回だけ試します。通った方を `warpProxy.cooldownMs`（既定5分）のあいだ使い続け、拒否された方はその間避けます。
+- `warpProxy.mode: "always"` — WARP に固定（従来の動き）。
+- `warpProxy.mode: "off"` — direct のみ。
+
+ホップは HTTP CONNECT プロキシです。Cloudflare WARP のプロキシモードは `127.0.0.1:40000` で喋り、他の CONNECT プロキシも同じです。そこへは小さな中継 `scripts/warp-relay.mjs` を介します。中継はトンネルをホップ経由で開き、ホップに届かなければ直接ソケットに切り替えるので、WARP が止まってもプロキシは使えます。
 
 ```bash
 sudo bash deploy/install-warp.sh          # WARP + 中継ユニット + zen-proxy の drop-in
 curl -s http://127.0.0.1:8890/__status    # トンネル数、ホップ経由か直接か
-curl -s http://127.0.0.1:8787/api/status  # 同じ数字をダッシュボード側から
+curl -s http://127.0.0.1:8787/api/status  # egress: いまどちらの経路か、どちらが拒否中か
 ```
 
 インストールされるもの:
@@ -286,9 +295,9 @@ curl -s http://127.0.0.1:8787/api/status  # 同じ数字をダッシュボード
 |---|---|---|
 | `cloudflare-warp` | apt（公式リポジトリ） | ホップ本体。プロキシモードで動き、ホストのルーティングには触れません |
 | `zen-proxy-warp-relay.service` | `/etc/systemd/system` | 中継を `127.0.0.1:8890` で動かす |
-| `zen-proxy.service.d/warp-proxy.conf` | `/etc/systemd/system` | `NODE_USE_ENV_PROXY=1` と `HTTPS_PROXY=http://127.0.0.1:8890` |
+| `zen-proxy.service.d/warp-proxy.conf` | `/etc/systemd/system` | ホップの場所（`WARP_PROXY_HOP`）と `WARP_PROXY_MODE=auto` を宣言するだけ |
 
-どちらのランタイムもプロセス起動時にこの変数を読みます（Bun は `HTTPS_PROXY` を直接、Node は `NODE_USE_ENV_PROXY=1` も必要）。つまりホップを有効にできるのはこの drop-in だけで、シェルで設定しても効きません。中継のポートは `HTTPS_PROXY` と一致させてください。既定はどちらも `8890` です。
+**`HTTPS_PROXY` をユニットに入れないでください。** プロセス全体の env プロキシは全リクエストを1つの出口に固定し、その出口が拒否された瞬間に全滅します（自動選択も効かなくなります）。起動時に env プロキシを見つけたら、zen-proxy は警告を出します。ホップのアドレスやポートを変えたときだけ再起動が必要で、`mode` の変更は次のリクエストから反映されます。
 
 元に戻す:
 
@@ -300,7 +309,7 @@ sudo systemctl daemon-reload && sudo systemctl restart zen-proxy
 sudo warp-cli --accept-tos registration delete && sudo apt-get remove -y cloudflare-warp
 ```
 
-有効にする前に知っておきたいことが2つあります。上流から見えるのは自分のアドレスではなく WARP の出口アドレスになること、WARP は接続ごとに別の出口を割り当てるため、1つのアドレスに紐づいた枠が付いてくる保証はないことです。
+知っておきたいこと: WARP 経由のとき上流から見えるのは自分のアドレスではなく WARP の出口です。WARP は接続ごとに出口を割り当てるため、1つのアドレスに紐づいた枠が付いてくる保証はありません。Bun は1本のトンネルを再利用するので、`/__status` のトンネル数はリクエスト毎には増えません。
 
 ---
 

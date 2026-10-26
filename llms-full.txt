@@ -194,9 +194,9 @@ Config lives in **`zen-proxy.json`** (auto-created on first run, hot-reloaded wh
 | `trustForwarded` | `false` | Trust `x-forwarded-for`/`x-real-ip` from a reverse proxy |
 | `timeoutMs` | `120000` | Upstream timeout for non-streaming |
 | `cacheMs` | `30000` | `/v1/models` cache TTL |
-| `warpProxy` | `{ "enabled": false, "port": 8890, "hop": "", "fallback": "direct" }` | Send the upstream calls through the local relay, which tunnels over an HTTP CONNECT proxy (Cloudflare WARP in proxy mode, or any CONNECT proxy) and falls back to a direct socket when the hop is down |
+| `warpProxy` | `{ "enabled": false, "port": 8890, "hop": "", "fallback": "direct", "mode": "auto", "cooldownMs": 300000 }` | A second exit: the local relay tunnels over an HTTP CONNECT proxy (Cloudflare WARP in proxy mode, or any CONNECT proxy) and falls back to a direct socket when the hop is down. `mode` selects the path per request (`auto` / `always` / `off`) |
 
-Env vars: `HOST`, `PORT`, `ZEN_URL`, `ZEN_UA`, `INJECT_SESSION` (`0` to disable), `AUTO_UA` (`0` to disable), `UA_REFRESH_MS`, `PROBE_AUTH`, `RESPONSES_MODELS` (JSON), `RATE_LIMIT_MAX`, `RATE_LIMIT_WINDOW_MS`, `DEFAULT_MODEL`, `FALLBACK_MODELS` (JSON), `MODEL_ALIASES` (JSON), `PROXY_KEY`, `ZEN_KEY`, `ZEN_KEYS`, `ZEN_KEYS_FILE`, `ZEN_KEYS_REFS`, `TRUST_FORWARDED=1`, `TIMEOUT_MS`, `CACHE_MS`, `WARP_PROXY_ENABLED=0`, `WARP_PROXY_PORT`, `WARP_PROXY_HOP`, `WARP_PROXY_FALLBACK`, `ZEN_PROXY_CONFIG` (custom config path).
+Env vars: `HOST`, `PORT`, `ZEN_URL`, `ZEN_UA`, `INJECT_SESSION` (`0` to disable), `AUTO_UA` (`0` to disable), `UA_REFRESH_MS`, `PROBE_AUTH`, `RESPONSES_MODELS` (JSON), `RATE_LIMIT_MAX`, `RATE_LIMIT_WINDOW_MS`, `DEFAULT_MODEL`, `FALLBACK_MODELS` (JSON), `MODEL_ALIASES` (JSON), `PROXY_KEY`, `ZEN_KEY`, `ZEN_KEYS`, `ZEN_KEYS_FILE`, `ZEN_KEYS_REFS`, `TRUST_FORWARDED=1`, `TIMEOUT_MS`, `CACHE_MS`, `SYNC_PROBE_MODELS`, `SYNC_IDLE_MS`, `FREE_TIER_FAST_FAIL=0`, `WARP_PROXY_ENABLED=0`, `WARP_PROXY_PORT`, `WARP_PROXY_HOP`, `WARP_PROXY_FALLBACK`, `WARP_PROXY_MODE`, `WARP_PROXY_COOLDOWN_MS`, `ZEN_PROXY_CONFIG` (custom config path).
 
 ### bring your own key
 
@@ -210,6 +210,8 @@ The free tier is tied to the exit address, and a shared exit is refused outright
 
 The hop is reached through `scripts/warp-relay.mjs`, a small local relay: it opens each tunnel over the hop and falls back to a direct socket when the hop is unreachable. Node's own env proxy has no failover, so pointing `HTTPS_PROXY` straight at WARP would take every upstream call down whenever `warp-svc` stops.
 
+**The hop is a second exit, chosen per request — never a process-wide proxy.** Measured on the deployed host inside one minute: the WARP exit answered `429 FreeUsageLimitError` to every request while the host's own address answered 200 for twelve in a row, and a four-way parallel burst. Which exit works flips over hours, so a fixed `HTTPS_PROXY` is the failure mode itself. With `warpProxy.mode: "auto"` the proxy starts direct, retries a quota-refused request once on the other path, keeps whichever answered for `cooldownMs`, and avoids the refused one. `always` pins the hop; `off` never uses it.
+
 ```bash
 sudo bash deploy/install-warp.sh     # WARP + relay unit + zen-proxy drop-in
 ```
@@ -218,15 +220,15 @@ sudo bash deploy/install-warp.sh     # WARP + relay unit + zen-proxy drop-in
 |---|---|
 | `cloudflare-warp` | apt, official repo; proxy mode, `127.0.0.1:40000` |
 | `zen-proxy-warp-relay.service` | `/etc/systemd/system` — the relay on `127.0.0.1:8890` |
-| `zen-proxy.service.d/warp-proxy.conf` | `/etc/systemd/system` — `NODE_USE_ENV_PROXY=1`, `HTTPS_PROXY=http://127.0.0.1:8890` |
+| `zen-proxy.service.d/warp-proxy.conf` | `/etc/systemd/system` — declares `WARP_PROXY_HOP` and `WARP_PROXY_MODE=auto`; **no** `HTTPS_PROXY` |
 
-Node reads `NODE_USE_ENV_PROXY` and `HTTPS_PROXY` when the process starts, so they belong in the unit file, not in a shell. `zen-proxy.json` carries the hop itself:
+Do not put `HTTPS_PROXY` / `NODE_USE_ENV_PROXY` in the unit: an env proxy pins every call and disables the automatic choice (the proxy warns at boot when it sees one). `zen-proxy.json` carries the hop and its policy:
 
 ```json
-{ "warpProxy": { "enabled": true, "port": 8890, "hop": "http://127.0.0.1:40000", "fallback": "direct" } }
+{ "warpProxy": { "enabled": true, "port": 8890, "hop": "http://127.0.0.1:40000", "fallback": "direct", "mode": "auto", "cooldownMs": 300000 } }
 ```
 
-`fallback: "direct"` means the relay uses a direct socket when the hop is down; `"none"` refuses instead. `GET /api/status` reports the hop under `warp` (tunnel counters, how many went over the hop, how many fell back), and the relay answers the same on `http://127.0.0.1:8890/__status`.
+`fallback: "direct"` means the relay uses a direct socket when the hop is down; `"none"` refuses instead. `GET /api/status` reports the hop under `warp` (tunnel counters, how many went over the hop, how many fell back) and the choice under `egress` (`active`, per-path health, why), and the relay answers the same counters on `http://127.0.0.1:8890/__status`.
 
 The upstream then sees the WARP exit address instead of yours, and WARP hands out a different exit address per connection — a quota tied to one address is not guaranteed to follow.
 
