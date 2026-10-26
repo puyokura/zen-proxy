@@ -31,7 +31,7 @@ anonymous free tier  ◦  no accounts  ◦  no keys  ◦  openai + anthropic com
 
 ## why it exists
 
-opencode's free `-free` models (`mimo-v2.5-free`, `big-pickle`, `nemotron`, …) are only served to requests that mimic the real client. Since opencode started requiring a full session identity, anything missing it gets `400 MissingSessionID`, and anything carrying only half of it gets `403 FreeTierError: "OpenCode's free tier can only be used from within OpenCode"` — even with a valid API key. The gateway is served from `https://opencode.ai/inference/v1`; the older `/zen/v1` base still lists models but now rejects all agent traffic. Most coding agents — like the *mimo* CLI fork — force their own identity and get slammed with that error (or `429 FreeUsageLimitError`).
+opencode's free `-free` models (`big-pickle`, `glm-*-free`, `deepseek-*-free`, …) are only served to requests indistinguishable from the OpenCode CLI itself. Since OpenCode 2 (2.1.x) the gate weighs much more than identity headers: the **TLS/HTTP stack** (the identical request streams 200 under Bun and gets `429 FreeUsageLimitError` under Node), the v2 base `https://opencode.ai/inference/openai/v1`, the v2 identity headers (`x-opencode-client`, `x-opencode-project`, `b3`/`traceparent`, session + affinity pairs), the **full harness system text** (a generic or truncated system prompt is refused however agent-shaped the request is), and OpenCode's own tool manifest (the bare `read` stub era is over). Any of these missing lands in a shared `429 FreeUsageLimitError` — with a `retry-after` window and zero personal usage — or a `403 FreeTierError`. Rapid model-hop bursts from one identity are blanket-refused; the same requests spaced ~0.4s pass.
 
 **zen-proxy** injects the correct `User-Agent` and a stable synthetic `x-opencode-session` / `x-opencode-session-id` pair per client, then re-exposes everything as a plain OpenAI API. No accounts, no API keys, no source patches.
 
@@ -40,7 +40,7 @@ opencode's free `-free` models (`mimo-v2.5-free`, `big-pickle`, `nemotron`, …)
   ▸ feature list
   
     - **OpenAI-compatible API** — `/v1/chat/completions` (stream + non-stream), `/v1/models`, `/v1/responses`
-    - **UA unlock** — injects `User-Agent: opencode/1.18.30` plus a stable per-client `x-opencode-session` / `x-opencode-session-id` pair upstream, the things that open the free tier
+    - **v2 client parity** — runs under Bun (Node fallback only for BYOK keys), sends the v2 UA `opencode/latest/<version>/cli`, the CLI's identity headers, mints real-format session ids, prepends the captured harness preamble to the system prompt, attaches OpenCode's full v2 tool manifest ahead of your tools, and filters every reply down to the calls the caller can run — renamed back where the caller has a counterpart (`read`→`Read`), dropped where it does not, invented tool names included
     - **BYOK** — ride anonymous `public` or bring your own Zen key (stable + no shared-pool throttling)
     - **Smart fallback** — tries models in order on `429`/`5xx` and dead-model `4xx` (e.g. "Model is unavailable"), honors `retry-after`
     - **Model aliases** — e.g. `gpt-4o → mimo-v2.5-free`, replies rewritten back
@@ -71,7 +71,7 @@ Or just clone and run — it's a single file, no `npm install`:
 
 ```bash
 git clone https://github.com/12errh/zen-proxy.git && cd zen-proxy
-node zen-proxy.mjs
+bun zen-proxy.mjs
 ```
 
 ---
@@ -79,7 +79,7 @@ node zen-proxy.mjs
 ## usage
 
 ```bash
-node zen-proxy.mjs            # or the installer's `zen-proxy` launcher
+bun zen-proxy.mjs            # or the installer's `zen-proxy` launcher
 # dashboard → http://127.0.0.1:8787/
 ```
 
@@ -154,7 +154,13 @@ If `zen-claude` reports `command not found`, check the symlink exists before bla
 
 `POST /v1/messages` and `POST /v1/messages/count_tokens` implement the Anthropic Messages protocol: system blocks, message content blocks, images, `tool_use`/`tool_result`, `thinking`, `tool_choice` and `stop_sequences` are all translated to the endpoint family the target model actually uses, and the reply is translated back including the full streaming envelope (`message_start` → `content_block_*` → `message_delta` → `message_stop`). Errors use Anthropic's `{type:"error",error:{type,message}}` shape. Both `x-api-key` and `Authorization: Bearer` authenticate.
 
-The free tier accepts an Anthropic request only when it also carries opencode's own tool manifest. Claude Code's system prompt is passed through untouched — it is never edited or replaced — but the proxy attaches opencode's built-in tools next to the caller's, limited to those the caller has a counterpart for, and renames resulting calls (`read`→`Read`, `filePath`→`file_path`, …) so the caller runs the tool it knows. Disable with `agentTools: false`.
+The free tier accepts a request only when it carries opencode's own v2 tool manifest, so the manifest rides on **every** request: opencode's 12 tools go first, the caller's own tools after them (an exact-name collision dedupes to the manifest's schema). The harness preamble is prepended ahead of the caller's system prompt — everything the caller sent still follows, nothing is edited away, and the prepend is idempotent. Calls whose mapped name the caller actually offers are renamed back (`read`→`Read`, `filePath`→`file_path`, …) so the caller runs the tool it knows; anything else is not returnable. Disable with `agentTools: false`.
+
+The reply layer enforces one rule on every route, streaming included: **a reply may only carry calls the caller can run.** A pinned caller (`tool_choice: {"type":"tool","name":…}`) keeps only the pinned call; every other tool-carrying caller keeps its own calls and loses the manifest calls it has no counterpart for — and, because the manifest rides, the provider sometimes answers with tools no one offered, including names it invents (`client_nonce_lookup` on a title request was streamed through once); those drop too, decided per request from the caller's own offered set. A caller that sent no tools at all (title generators, plain pings) strips every `tool_call` from its reply, and a reply whose every call got filtered ends `end_turn`/`stop` instead of claiming a call that does not exist. Argument chunks of a dropped call are dropped with it, because a call's name arrives chunks apart from its arguments.
+
+## Responses API
+
+`POST /v1/responses` reads either dialect, decided by the body, and answers in the same one: a body that speaks Responses (`input`, flat tools, `tool_choice: {"type":"function","name":…}`, `max_output_tokens`, optional `instructions`) is translated — on chat-family models via chat completions, and reply items are rebuilt in Responses shape (`message` items with `output_text`, `function_call` items, `reasoning`); a chat-shaped `messages` body is answered with a `chat.completion` as before. Streaming emits the gateway's own Responses SSE (`response.created` → `output_item.added` / `output_text.delta` / `function_call_arguments.delta` → `response.completed`, no `[DONE]`); on responses-family models the upstream stream passes through with the model id rewritten. The free-tier bridge and pinned-call rules apply here identically: the manifest rides ahead of any tools the body brings, and the reply keeps only the calls the caller can run — a tool-less body loses every manifest call, a pinned request keeps only the pinned call, and names the provider invents drop for everyone. Reasoning items in the request are skipped (their provider state has no chat counterpart).
 
 ## configuration
 
@@ -164,12 +170,15 @@ Config lives in **`zen-proxy.json`** (auto-created on first run, hot-reloaded wh
 |---|---|---|
 | `host` | `127.0.0.1` | Bind address (restart needed) |
 | `port` | `8787` | Listen port (restart needed) |
-| `upstream` | `https://opencode.ai/inference/v1` | Zen API base |
-| `ua` | `opencode/1.18.30` | The `User-Agent` that unlocks the free tier (auto-updates to new opencode releases) |
-| `autoUA` | `true` | Track opencode releases and update `ua` automatically (`opencode/<latest>`) |
+| `upstream` | `https://opencode.ai/inference/openai/v1` | Zen gateway base (v2; model discovery stays on `/inference/v1`) |
+| `ua` | `opencode/latest/2.1.4/cli` | The v2 CLI's User-Agent format; part of what the free-tier gate reads |
+| `autoUA` | `true` | Track opencode releases and update `ua` automatically (skips updating 1.x releases to a v2-style UA; npm only carries 1.x) |
 | `uaRefreshMs` | `21600000` | How often to check for a new opencode version (ms) |
-| `injectSession` | `true` | Mint the `x-opencode-session` + `x-opencode-session-id` pair per client (upstream rejects requests that lack either) |
-| `gated` (sync state) | — | Models answering `403 FreeTierError`: the free tier only accepts genuine agent requests, so our probe can't verify them. Shown as **agent-only**, kept in the list, never removed |
+| `clientName` / `projectHash` / `tracing` | `cli` / auto / `true` | The v2 identity headers: `x-opencode-client`, per-install `x-opencode-project` (sha1 of `directory:<cwd>`), and `b3`/`traceparent` tracing |
+| `agentPreamble` | `""` (= auto) | `""`/`auto` → the shipped harness preamble (`agent-preamble.txt`) prepended to the system prompt; `off`/`none` → none; any other text → used verbatim |
+| `injectSession` | `true` | Mint the `x-opencode-session` + `x-opencode-session-id` pair (plus `x-session-affinity`/`x-session-id`) per client |
+| `agentTools` | `true` | Attach OpenCode's v2 tool manifest (from `agent-tools.json`) to every request, ahead of your tools; replies keep only the calls you can run — manifest calls whose mapped name you offer are renamed back to your tool's name, the rest are dropped |
+| `gated` (sync state) | — | Models answering `403 FreeTierError`: the free tier's gate refused the probe. Shown as **agent-only**, kept in the list, never removed |
 | `probeAuth` | `auto` | Credentials for auto-sync health probes: `auto` (your Zen key if set, else anonymous), `anonymous` (always the public free tier), or `key` (always your key, so probes reflect your own quota) |
 | `defaultModel` | `""` | Empty = auto: pick the first *healthy* free model (no more hardcoded/vanished defaults) |
 | `fallbackModels` | *(from `models.json`)* | Tried in order on `429`/`5xx` and dead-model `4xx`. Omit it to follow the shipped catalog (refreshed by the model-sync Action every 6h); save it from the dashboard to pin your own list |
@@ -228,7 +237,7 @@ The upstream then sees the WARP exit address instead of yours, and WARP hands ou
 | Method | Path | Description |
 |---|---|---|
 | `POST` | `/v1/chat/completions` | Chat completions (stream + non-stream) |
-| `POST` | `/v1/responses` | Responses passthrough |
+| `POST` | `/v1/responses` | Responses API in either dialect — Responses bodies on the route get Responses replies, chat bodies keep chat replies; bridge and pinned filters apply |
 | `POST` | `/v1/systemone` | System One classifier (`jev-1.13-free`); body and reply relayed unchanged |
 | `GET` | `/v1/models` | Allowed models (cached) |
 | `GET` | `/health` | Health check |
@@ -284,7 +293,7 @@ If your agent **streams** (Claude Code, Cline, Roo Code, Continue, Aider, mimo, 
 You don't need to change anything. When a fallback happens the response tells you:
 
 ```jsonc
-{ "model": "mimo-v2.6-flash-free", "zen_served_by": "space-bunny-free", /* … */ }
+{ "model": "mimo-v2.6-flash-free", "zen_served_by": "big-pickle", /* … */ }
 ```
 
 plus response headers `x-zen-served-by` and `x-zen-fallback: true`.

@@ -3,7 +3,7 @@
   "env": {
     "ANTHROPIC_BASE_URL": "http://127.0.0.1:8787",
     "ANTHROPIC_AUTH_TOKEN": "public",
-    "ANTHROPIC_MODEL": "space-bunny-free",
+    "ANTHROPIC_MODEL": "deepseek-v4.1-flash-free",
     "CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT": "1"
   },
   "permissions": {

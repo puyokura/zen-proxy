@@ -42,7 +42,7 @@ async function loadModels() {
 }
 
 const models = await loadModels()
-const firstModel = models[0] ?? "space-bunny-free"
+const firstModel = models[0] ?? "deepseek-v4.1-flash-free"
 const settings = {
   env: {
     ANTHROPIC_BASE_URL: `http://127.0.0.1:${port}`,

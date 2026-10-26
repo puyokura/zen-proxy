@@ -427,6 +427,9 @@ textarea { resize:vertical; min-height:96px; font-family:var(--mono); font-size:
           <div class="row" style="gap:8px;margin-top:2px">
             <span class="hint mono" id="cfgWarp"></span>
           </div>
+          <div class="row" style="gap:8px;margin-top:2px">
+            <span class="hint mono" id="cfgRuntime"></span>
+          </div>
           <label>Timeout (ms)</label><input id="cfgTimeout" type="number">
         </div>
       </div>
@@ -446,6 +449,17 @@ textarea { resize:vertical; min-height:96px; font-family:var(--mono); font-size:
       <div class="checkbox"><input type="checkbox" id="cfgAutoUA"><span>Auto-track opencode releases &amp; update the User-Agent</span></div>
       <label>User-agent refresh interval (ms)</label><input id="cfgUaMs" type="number">
       <div class="checkbox"><input type="checkbox" id="cfgInject"><span>Inject <code>x-opencode-session</code> header per client (free tier needs it)</span></div>
+      <label>Agent preamble (the v2 gate's harness text)</label>
+      <select id="cfgPreamble" style="width:100%">
+        <option value="auto">Auto — ship the captured opencode harness preamble</option>
+        <option value="off">Off — no preamble (BYOK / custom wire)</option>
+        <option value="custom">Custom — use the text already in zen-proxy.json</option>
+      </select>
+      <div class="row" style="gap:10px;margin-top:6px">
+        <div><label>Client name</label><input id="cfgClient" type="text" style="width:140px"></div>
+        <div><label>Project hash</label><input id="cfgProject" type="text" style="width:260px" placeholder="sha1(directory:cwd)"></div>
+      </div>
+      <div class="checkbox"><input type="checkbox" id="cfgTracing"><span>Send <code>b3</code> / <code>traceparent</code> (v2 wire parity)</span></div>
       <div class="checkbox"><input type="checkbox" id="cfgRateLimit"><span>Rate-limit chat requests per client (0 = off)</span></div>
       <div class="row" style="gap:10px;margin-top:6px">
         <div><label>Requests / window</label><input id="cfgRateMax" type="number" min="0" style="width:120px"></div>
@@ -769,6 +783,11 @@ async function populateConfigForm() {
   $("cfgAutoUA").checked = config.autoUA !== false
   $("cfgUaMs").value = config.uaRefreshMs ?? 21600000
   $("cfgInject").checked = config.injectSession !== false
+  const preambleMode = config.agentPreamble == null ? "auto" : String(config.agentPreamble).trim()
+  $("cfgPreamble").value = preambleMode === "" || preambleMode === "auto" ? "auto" : preambleMode === "off" || preambleMode === "none" ? "off" : "custom"
+  $("cfgClient").value = config.clientName ?? "cli"
+  $("cfgProject").value = config.projectHash ?? ""
+  $("cfgTracing").checked = config.tracing !== false
   $("cfgRateLimit").checked = Number(config.rateLimitMax) > 0
   $("cfgRateMax").value = config.rateLimitMax ?? 0
   $("cfgRateWindow").value = config.rateLimitWindowMs ?? 60000
@@ -793,6 +812,10 @@ async function populateConfigForm() {
         " · tunnels " + (warp.tunnels ?? 0) +
         " (hop " + (warp.viaHop ?? 0) + " / direct " + (warp.viaDirect ?? 0) + " / fallbacks " + (warp.fallbacks ?? 0) + ")"
       : "hop: off"
+    const rt = st.runtime || {}
+    $("cfgRuntime").textContent = rt.name
+      ? "runtime: " + rt.name + " " + (rt.version || "") + (rt.bun ? " · free tier reachable" : " · free tier needs bun")
+      : "runtime: unknown"
   } catch {}
 }
 
@@ -814,6 +837,9 @@ async function saveConfig() {
     autoUA: $("cfgAutoUA").checked,
     uaRefreshMs: Number($("cfgUaMs").value || 21600000),
     injectSession: $("cfgInject").checked,
+    clientName: $("cfgClient").value.trim() || "cli",
+    projectHash: $("cfgProject").value.trim(),
+    tracing: $("cfgTracing").checked,
     rateLimitMax: $("cfgRateLimit").checked ? Number($("cfgRateMax").value || 0) : 0,
     rateLimitWindowMs: Number($("cfgRateWindow").value || 60000),
   }

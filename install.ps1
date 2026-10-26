@@ -28,6 +28,14 @@ if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
   Die "Node.js >= 18 is required. Install from https://nodejs.org then re-run."
 }
 
+# The free tier fingerprints the client's TLS/HTTP stack: Node's fetch is
+# bucketed `429 FreeUsageLimitError` even for agent-shaped requests, Bun's is
+# not. Bun is the anonymous (no-key) mode's requirement; BYOK works on node.
+if (-not (Get-Command bun -ErrorAction SilentlyContinue)) {
+  Info "NOTE: bun not found - anonymous 'public' access needs it (Node's stack gets 429'd on the free tier)."
+  Info "      Install with: powershell -c `"irm https://bun.sh/install.ps1 | iex`""
+}
+
 if ([string]::IsNullOrWhiteSpace($InstallDir) -or $InstallDir -eq "/") {
   Die "Refusing to install into '$InstallDir'"
 }
@@ -78,7 +86,8 @@ if (-not (Test-Path $ConfigPath)) {
 $Script = Join-Path $InstallDir "zen-proxy.ps1"
 Set-Content -Path $Script -Value @"
 # Zen Proxy launcher
-node "$InstallDir\zen-proxy.mjs" `$args
+`$runner = if (Get-Command bun -ErrorAction SilentlyContinue) { "bun" } else { "node" }
+& `$runner "$InstallDir\zen-proxy.mjs" @args
 "@
 
 # Put `zen-proxy` and `zen-claude` on PATH so Windows gets the same two-command
@@ -88,7 +97,8 @@ New-Item -ItemType Directory -Force -Path $BinDir | Out-Null
 
 Set-Content -Path (Join-Path $BinDir "zen-proxy.cmd") -Value @"
 @echo off
-node "$InstallDir\zen-proxy.mjs" %*
+where bun >nul 2>nul
+if %ERRORLEVEL%==0 (bun "$InstallDir\zen-proxy.mjs" %*) else (node "$InstallDir\zen-proxy.mjs" %*)
 "@
 
 foreach ($shim in @("claude-zen.ps1", "claude-zen.cmd")) {
@@ -121,4 +131,4 @@ if (Get-Command claude -ErrorAction SilentlyContinue) {
 Info "  Point your AI agent at:"
 Info "    baseURL = http://127.0.0.1:$Port/v1"
 Info "    apiKey  = public"
-Info "    model   = space-bunny-free   (or any model listed in the dashboard)"
+Info "    model   = deepseek-v4.1-flash-free   (or any model listed in the dashboard)"

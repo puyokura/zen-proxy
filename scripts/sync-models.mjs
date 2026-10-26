@@ -5,13 +5,11 @@
 // brand-new free models get appended, models that upstream no longer offers get
 // removed. That is the whole job.
 //
-// Why there is no health probe here: the free tier only answers requests that
-// look like genuine agent traffic — a valid session pair, `stream: true`, and a
-// system prompt carrying opencode's own wording. A synthetic probe is rejected
-// with 403 FreeTierError even for models that are working perfectly, and a
-// retired model is rejected exactly the same way, so a probe can tell you
-// nothing about which models are alive. The `/models` catalog is the only
-// authoritative source for that, and it needs no auth.
+// Why there is no health probe here: the v2 free tier refuses anything it cannot
+// tie to a real opencode client, and its refusal (`429 FreeUsageLimitError`) is
+// byte-identical to a spent quota — so a probe from this bot could not tell a
+// working model from a refused one. The `/models` catalog is the only
+// authoritative source for existence, and it needs no auth.
 //
 // Model health is not this file's business. The proxy learns it from real client
 // traffic at runtime instead, which is the only signal that is actually

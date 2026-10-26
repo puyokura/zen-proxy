@@ -4,14 +4,16 @@ import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import { execFile } from "node:child_process"
-import { fileURLToPath } from "node:url"
+import { fileURLToPath, pathToFileURL } from "node:url"
 import { promisify } from "node:util"
-
 const run = promisify(execFile)
 
 // The config file is read once, when the module loads, so every case gets its
 // own process with its own ZEN_PROXY_CONFIG.
 const MODULE = fileURLToPath(new URL("../zen-proxy.mjs", import.meta.url))
+// A Windows absolute path is not a valid ESM specifier on its own — the child
+// would reject it with ERR_UNSUPPORTED_ESM_URL_SCHEME. Hand it a file URL.
+const MODULE_URL = pathToFileURL(MODULE).href
 
 // A port nothing listens on: the relay is not running there, so the status
 // reports it as down.
@@ -27,7 +29,7 @@ function writeConfig(dir, config) {
 // proxy-hop block it ended up with.
 async function loadWarpProxy(configFile) {
   const script = `
-    const zp = await import(${JSON.stringify(MODULE)})
+    const zp = await import(${JSON.stringify(MODULE_URL)})
     const status = await zp.relayStatus()
     process.stdout.write(JSON.stringify({ warpProxy: zp.config.warpProxy, status }))
   `

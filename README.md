@@ -7,8 +7,11 @@
 <p align="center"><sub>No account. No API key. OpenAI&nbsp;and&nbsp;Anthropic&nbsp;compatible. Runs on your machine.</sub></p>
 
 <p align="center">
+  <a href="https://discord.gg/Dw5Ctrtuw">
+    <img src="https://img.shields.io/badge/Discord-Join%20the%20server-5865F2?style=flat-square&labelColor=1a1612&logo=discord&logoColor=white" alt="Join the Discord server">
+  </a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-ccf73a?style=flat-square&labelColor=1a1612" alt="MIT License"></a>
-  <img src="https://img.shields.io/badge/node-%3E%3D18-8b8b8b?style=flat-square&labelColor=1a1612" alt="Node 18+">
+  <img src="https://img.shields.io/badge/bun-1.2%2B%20(or%20node%2018%2B%20BYOK)-8b8b8b?style=flat-square&labelColor=1a1612" alt="Bun 1.2+">
   <img src="https://img.shields.io/badge/dependencies-0-8b8b8b?style=flat-square&labelColor=1a1612" alt="Zero dependencies">
   <a href="#any-openai-compatible-agent">
     <img src="https://img.shields.io/badge/OpenAI_compatible-8b8b8b?style=flat-square&labelColor=1a1612&logo=openai" alt="OpenAI compatible">
@@ -16,6 +19,14 @@
   <a href="#claude-code">
     <img src="https://img.shields.io/badge/Claude_Code-compatible-8b8b8b?style=flat-square&labelColor=1a1612&logo=anthropic" alt="Claude Code compatible">
   </a>
+</p>
+
+<p align="center">
+  <img src="assets/brag-demo.gif" alt="zen-proxy in 25 seconds: install → run the proxy → zen-claude → point any OpenAI-compatible agent at it" width="860" />
+  <br />
+  <sub>
+    <a href="assets/brag-demo.mp4">▶ full video with sound</a>
+  </sub>
 </p>
 
 ---
@@ -74,7 +85,7 @@ Confirm the proxy is up:
 
 ```bash
 curl -s http://127.0.0.1:8787/health
-# {"ok":true,"upstream":"https://opencode.ai/inference/v1"}
+# {"ok":true,"upstream":"https://opencode.ai/inference/openai/v1"}
 ```
 
 <details>
@@ -94,7 +105,7 @@ It stays up until you stop it, so you point your agent at it once and keep using
 | | |
 |---|---|
 | `POST /v1/chat/completions` | OpenAI, streaming and not |
-| `POST /v1/responses` | OpenAI Responses API, translated both ways |
+| `POST /v1/responses` | OpenAI Responses API, translated both ways — a body that speaks Responses gets Responses back, a chat body keeps its chat reply |
 | `POST /v1/messages` | Anthropic Messages API — **this is the Claude Code one** |
 | `POST /v1/messages/count_tokens` | Anthropic token estimate |
 | `POST /v1/systemone` | System One classifier (`jev-1.13-free`) — request and reply relayed unchanged |
@@ -110,38 +121,42 @@ The free-model catalog in [`models.json`](models.json) is refreshed from OpenCod
 
 ## Why a proxy is needed
 
-OpenCode's free models are served only to the OpenCode CLI itself. Everyone else gets:
+OpenCode's free models are served only to the OpenCode CLI itself. Everyone else gets one of:
 
 ```
 403 FreeTierError: OpenCode's free tier can only be used from within OpenCode
+429 FreeUsageLimitError: Free usage limit reached …   ← what you get instead now
 ```
 
-zen-proxy sits in front of that gateway and identifies your agent as a real session.
+Since OpenCode 2, the second one is what a non-CLI client sees — with a `retry-after` window and zero personal usage. It is not your quota: it is the gate's verdict on the request.
+
+zen-proxy sits in front of that gateway and makes your agent's traffic indistinguishable from the CLI's, on three layers — all measured from a byte-capture of a real OpenCode 2.1.4 request.
 
 <details>
 <summary>What it actually changes</summary>
 
 | Gateway requirement | What zen-proxy does |
 |---|---|
-| `x-opencode-session` **and** `x-opencode-session-id`, same value | Mints a stable per-client id and sends both |
-| The id must look real — its first 12 hex chars encode a timestamp | Generates ids in OpenCode's own format, not random hex |
-| Base must be `https://opencode.ai/inference/v1` | Uses it, and migrates configs still pointing at the retired `/zen/v1` |
-| Streaming, a system message, tool definitions | Real agents already send these; the proxy fills gaps where it can |
+| **Run under Bun.** The gate fingerprints the TLS/HTTP stack — the exact bytes that stream `200` under Bun's fetch get `429 FreeUsageLimitError` from Node's (same second, same session) | `zen-proxy` / `zen-claude` prefer bun; node works with a BYOK key, and the proxy warns at boot under node |
+| The v2 endpoint `https://opencode.ai/inference/openai/v1` | Uses it, and migrates old configs pointing at `/inference/v1` or `/zen/v1` |
+| The v2 wire identity: `x-opencode-client`, `x-opencode-project` (sha1, per-install), `b3`/`traceparent`, affinity pair | Sends all of it, in the CLI's own formats |
+| The **OpenCode harness system text** — requests whose system prompt is not the CLI's harness preamble are refused however agent-shaped the rest is (a generic prompt, the opening line, or a ~1.8 KB cut of it are all refused) | Prepends the captured harness preamble (`agent-preamble.txt`) ahead of your agent's own instructions, on every route, idempotently |
+| OpenCode's own tool manifest (the gate refuses a bare `read` stub now) | Attaches the captured v2 manifest (`agent-tools.json`: read/edit/glob/grep/shell/write are the ones whose name your agent maps to) ahead of your tools, renames the mapped calls back to your agent's names, and drops the rest |
+| Streams with `stream_options` and a real `max_completion_tokens` | Mirrors the CLI's shape on health probes, and forwards yours untouched |
 
-For `/v1/messages` specifically, the gateway also requires OpenCode's own tool manifest, so zen-proxy attaches those tools alongside Claude Code's and renames the resulting calls back. **Claude Code's system prompt is passed through untouched.**
+**Run it with bun** (`bun zen-proxy.mjs`, or through `zen-proxy`/`zen-claude`, which pick bun when present): that is the one requirement node cannot substitute away — the gateway 429s node's stack even though headers, sessions and bodies are byte-identical.
 
-The OpenAI-shaped routes get no name mapping, so they are handled differently: a request carrying **no tools at all** — an agent's own internal call, like summarization or title generation — is given OpenCode's own tool manifest so it passes the gate, exactly as opencode sends it on every call. The gateway does not honour `tool_choice: "none"` — it answers a plain summarization prompt with real `read` calls — so any tool call is stripped from the reply instead, on both OpenAI-shaped routes.
+For replies, one rule: a reply may only carry calls your agent can actually run. An agent turn with its own tools keeps its calls (mapped manifest calls come back renamed) and loses everything else — manifest names it has no counterpart for, and tool names the provider invents; a `tool_choice`-pinned turn keeps only the pinned call; a reply with no tools attached at all (title generators, plain pings) is stripped of every `tool_call`. Health probes send the same harness preamble + manifest + a real ask (serially, spaced out — the gate blanket-403s a rapid model-hop burst from one identity), so a model in the dashboard's `ok` row genuinely answered; the old `rate-limited` parking behaviour is gone (a `FreeUsageLimitError` bucket no longer removes or dead-labels a model).
 </details>
 
 <details>
 <summary>Gotchas worth knowing before you file a bug</summary>
 
 - **This rides an anonymous free tier.** Per-IP quotas, shared pool, sometimes saturated. Bring a key if you need reliability.
-- **A bare `curl` gets `403`.** The gateway only answers genuine *agent* traffic. Every agent above does this; a hand-rolled chat client won't.
-- **Health probes are agent-shaped.** Sync sends each model the same thing a real client sends — opencode's tool manifest plus `stream: true` — so `ok` means the model genuinely answered. A model marked `gate-blocked` is one the free-tier gate refused even for that shape; blocks lift on their own and the model is never dropped. Real traffic is still tracked on top (`ok (live traffic)`).
-- **Probing tells real health; the catalog tells existence.** A retired model answers `400 Model is unavailable` and is not added, while a live one answers with a stream — so the list reflects what actually works, not just what upstream advertises.
+- **A bare `curl` gets 429/403.** The gateway only answers genuine *agent* traffic (harness preamble, manifest, plausible wire) — every agent above does this; a hand-rolled chat client won't.
+- **Health probes are agent-shaped.** Sync sends each model the same thing a real v2 client sends — harness preamble, OpenCode's manifest, `stream_options`, a real token budget — serially, with a beat between hops (a rapid burst from one identity is blanket-refused), so `ok` means the model actually streamed. A `FreeUsageLimitError` probe never marks a model dead or drops it from your list.
 - **Fallbacks announce themselves** via `zen_served_by` and the `x-zen-served-by` / `x-zen-fallback` headers.
-- **`agent-tools.json` is a capture of OpenCode's tools.** If OpenCode changes its tool schemas, the `/v1/messages` bridge may stop satisfying the gateway. Re-capture it from any OpenCode request.
+- **`agent-tools.json` and `agent-preamble.txt` are captures of OpenCode v2.1.4's request.** If OpenCode changes its harness text or tool schemas, re-capture both from any real request (the gate fingerprints the preamble; the first 139 characters are not enough). The preamble file is plain text; the tools file accepts a bare array or `{"tools":[...]}`.
 </details>
 
 ---
@@ -156,13 +171,15 @@ The OpenAI-shaped routes get no name mapping, so they are handled differently: a
 | Key | Default | Description |
 |---|---|---|
 | `host` / `port` | `127.0.0.1` / `8787` | Bind address (restart required) |
-| `upstream` | `https://opencode.ai/inference/v1` | Zen gateway base |
-| `ua` / `autoUA` | `opencode/1.18.30` / `true` | User-Agent sent upstream; auto-tracks OpenCode releases |
-| `injectSession` | `true` | Mint and send the session header pair |
-| `agentTools` | `true` | Attach OpenCode's tools to `/v1/messages`, and to tool-less requests on the OpenAI-shaped routes |
+| `upstream` | `https://opencode.ai/inference/openai/v1` | Zen gateway base (v2; discovery stays on `/inference/v1`) |
+| `ua` / `autoUA` | `opencode/latest/2.1.4/cli` / `true` | The v2 CLI's UA format; auto-tracking skips v2-style UAs (npm only carries 1.x) |
+| `clientName` / `projectHash` / `tracing` | `cli` / auto / `true` | The v2 identity headers: `x-opencode-client`, per-install `x-opencode-project` (sha1 of `directory:<cwd>`), `b3`/`traceparent` |
+| `injectSession` | `true` | Mint and send the session header pair + affinity pair |
+| `agentPreamble` | `""` (= auto) | `""`/`auto` → shipped harness preamble; `off`/`none` → none; other text → used verbatim |
+| `agentTools` | `true` | Attach OpenCode's v2 manifest to every request, ahead of your agent's tools; replies keep only the calls your agent can run — mapped ones renamed back, the rest dropped |
 | `defaultModel` | `""` | Empty = auto-pick the first working free model |
 | `fallbackModels` | *(from [`models.json`](models.json))* | Tried in order on failure. Omit to follow the catalog; save once to pin your own list |
-| `modelAliases` | `{}` | e.g. `{"gpt-4o": "space-bunny-free"}` |
+| `modelAliases` | `{}` | e.g. `{"gpt-4o": "deepseek-v4.1-flash-free"}` |
 | `responsesModels` | `["gpt-5*","gpt-6*","grok-*","muse-spark-*"]` | Models served on `/v1/responses`; patterns may end in `*` |
 | `defaultZenKey` | `""` | Your own Zen key instead of anonymous `public` |
 | `zenKeys` / `zenKeysFile` / `zenKeysRefs` | `[]` / `""` / `[]` | More Zen credentials: a key list, or the `refs:` names to read out of a credentials file such as `~/.dsh/.credentials.yaml`. Two or more accounts are rotated per request; a key answering `401`/`429` passes the request to the next one, and the anonymous tier stays the last resort. |
@@ -173,7 +190,7 @@ The OpenAI-shaped routes get no name mapping, so they are handled differently: a
 | `trustForwarded` | `false` | Honour `x-forwarded-for` behind a reverse proxy |
 | `warpProxy` | `{ "enabled": false, "port": 8890, "hop": "", "fallback": "direct" }` | Send the upstream calls through a local relay that tunnels over an HTTP CONNECT proxy — Cloudflare WARP in proxy mode, or any CONNECT proxy. The relay falls back to a direct socket when the hop is down. See [WARP](#warp) |
 
-`HOST` `PORT` `ZEN_URL` `ZEN_UA` `INJECT_SESSION=0` `AUTO_UA=0` `UA_REFRESH_MS` `AGENT_TOOLS=0` `PROBE_AUTH` `DEFAULT_MODEL` `FALLBACK_MODELS` `MODEL_ALIASES` `RESPONSES_MODELS` `PROXY_KEY` `ZEN_KEY` `ZEN_KEYS` `ZEN_KEYS_FILE` `ZEN_KEYS_REFS` `TRUST_FORWARDED=1` `TIMEOUT_MS` `CACHE_MS` `RATE_LIMIT_MAX` `RATE_LIMIT_WINDOW_MS` `AUTO_SYNC=0` `AUTO_SYNC_MS` `WARP_PROXY_ENABLED=0` `WARP_PROXY_PORT` `WARP_PROXY_HOP` `WARP_PROXY_FALLBACK` `ZEN_PROXY_CONFIG`
+`HOST` `PORT` `ZEN_URL` `ZEN_UA` `ZEN_CLIENT` `ZEN_PROJECT_HASH` `ZEN_TRACING=0` `INJECT_SESSION=0` `AUTO_UA=0` `UA_REFRESH_MS` `AGENT_TOOLS=0` `AGENT_PREAMBLE=off` `ZEN_PROXY_AGENT_TOOLS` `ZEN_PROXY_AGENT_PREAMBLE` `PROBE_AUTH` `DEFAULT_MODEL` `FALLBACK_MODELS` `MODEL_ALIASES` `RESPONSES_MODELS` `PROXY_KEY` `ZEN_KEY` `ZEN_KEYS` `ZEN_KEYS_FILE` `ZEN_KEYS_REFS` `TRUST_FORWARDED=1` `TIMEOUT_MS` `CACHE_MS` `RATE_LIMIT_MAX` `RATE_LIMIT_WINDOW_MS` `AUTO_SYNC=0` `AUTO_SYNC_MS` `WARP_PROXY_ENABLED=0` `WARP_PROXY_PORT` `WARP_PROXY_HOP` `WARP_PROXY_FALLBACK` `ZEN_PROXY_CONFIG`
 
 Anonymous `public` access shares a per-IP quota that is sometimes saturated. Set `defaultZenKey`, or send `x-zen-key` per request, for steadier service. With several accounts configured (`zenKeys` or the refs of `zenKeysFile`) they are used in turn, so a per-account quota is no longer the ceiling; `/api/status` reports the pool and per-account request counts, masked.
 </details>
@@ -209,10 +226,16 @@ Anonymous `public` access shares a per-IP quota that is sometimes saturated. Set
 <details>
 <summary>Running as a service (Linux)</summary>
 
-`install.sh` offers to install a systemd unit, or:
+`install.sh` offers to install a systemd unit (which prefers `bun` when it is on `PATH`), or:
 
 ```bash
 sudo systemctl enable --now zen-proxy
+```
+
+With Bun installed outside `PATH` (for example `~/.bun/bin/bun`), point the unit at it explicitly — the free tier does not answer Node's stack:
+
+```ini
+ExecStart=/home/<user>/.bun/bin/bun /path/to/zen-proxy.mjs
 ```
 </details>
 
@@ -257,7 +280,7 @@ What it installs:
 | `zen-proxy-warp-relay.service` | `/etc/systemd/system` | Runs the relay on `127.0.0.1:8890` |
 | `zen-proxy.service.d/warp-proxy.conf` | `/etc/systemd/system` | `NODE_USE_ENV_PROXY=1` and `HTTPS_PROXY=http://127.0.0.1:8890` |
 
-Node reads those two variables when the process starts, so the drop-in is the only place that can turn the hop on — set them in the unit, not in a shell. The relay's port has to match `HTTPS_PROXY`; both default to `8890`.
+Both runtimes read those variables when the process starts — Bun uses `HTTPS_PROXY` directly, Node needs `NODE_USE_ENV_PROXY=1` alongside it — so the drop-in is the only place that can turn the hop on: set them in the unit, not in a shell. The relay's port has to match `HTTPS_PROXY`; both default to `8890`.
 
 Roll back:
 
@@ -272,6 +295,12 @@ sudo warp-cli --accept-tos registration delete && sudo apt-get remove -y cloudfl
 Two things worth knowing before you turn it on: the upstream then sees the WARP exit address instead of yours, and WARP hands out a different exit address per connection, so a quota tied to one address is not guaranteed to follow you.
 
 ---
+
+<p align="center">
+  <sub>💬 <a href="https://discord.gg/Dw5Ctrtuw">Join the Discord</a> — install help, troubleshooting, and which free model is fast right now.</sub>
+  <br />
+  <sub>The demo video up top was built using the brag skill.</sub>
+</p>
 
 <p align="center">
   <sub>Machine-readable: <a href="llms.txt">llms.txt</a> &nbsp;·&nbsp; <a href="llms-full.txt">llms-full.txt</a></sub>

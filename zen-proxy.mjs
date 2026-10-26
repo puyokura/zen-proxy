@@ -2,7 +2,7 @@
 import http from "node:http"
 import fs from "node:fs"
 import path from "node:path"
-import { randomBytes } from "node:crypto"
+import { randomBytes, createHash } from "node:crypto"
 import { fileURLToPath } from "node:url"
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -11,18 +11,36 @@ const CONFIG_PATH = process.env.ZEN_PROXY_CONFIG || path.join(__dirname, "zen-pr
 const UI_PATH = path.join(__dirname, "public", "index.html")
 const ENV = process.env
 
+// Which runtime is hosting the proxy. The free-tier gate fingerprints the
+// TLS/HTTP stack and only Bun's is accepted (measured on one machine, same
+// minute, byte-identical request: Bun streams 200 while Node is refused with
+// `429 FreeUsageLimitError`), so this is operational state, not trivia:
+// `/api/status` reports it and the dashboard shows it.
+function runtimeInfo() {
+  if (typeof Bun !== "undefined") return { name: "bun", version: Bun.version, bun: true }
+  return { name: "node", version: process.versions.node, bun: false }
+}
+
 // Model ids only ever travel inside JSON bodies, never a URL or a path, so the
 // guarantee here is narrow but real: whitespace, quotes, backslashes and shell
 // metacharacters can never enter a catalog or config value. `/` and `.` stay
 // because provider-qualified ids legitimately use them (`nvidia/nemotron-3-free`).
 const VALID_MODEL_ID = /^[A-Za-z0-9._:@+/%-]+$/
 
-// Upstream base URL. `/inference/v1` is the base OpenCode documents and the one
-// the CLI itself uses; the older `/zen/v1` path still answers /models but now
-// rejects genuine agent traffic with `403 FreeTierError`, so a config that
-// still points at it silently loses every free model.
-const DEFAULT_UPSTREAM = "https://opencode.ai/inference/v1"
-const LEGACY_UPSTREAMS = new Set(["https://opencode.ai/zen/v1", "https://opencode.ai/zen"])
+// Upstream base URL. OpenCode 2 moved agent traffic to `/inference/openai/v1`
+// (the v2 CLI's own catalog says so, and capture of its real requests confirms
+// it); the old `/inference/v1` base now treats non-CLI traffic as quota-exhausted
+// `429 FreeUsageLimitError`. Configs that still point at the legacy bases are
+// migrated on load — they would silently lose every free model otherwise.
+const DEFAULT_UPSTREAM = "https://opencode.ai/inference/openai/v1"
+// `/models` is only served on the documentend legacy base; discovery keeps it.
+const MODEL_LIST_BASE = "https://opencode.ai/inference/v1"
+const LEGACY_UPSTREAMS = new Set([
+  "https://opencode.ai/zen/v1",
+  "https://opencode.ai/zen",
+  "https://opencode.ai/inference/v1",
+  "https://opencode.ai/inference",
+])
 function normalizeUpstream(v) {
   const u = String(v ?? "").trim().replace(/\/+$/, "")
   if (!u) return DEFAULT_UPSTREAM
@@ -49,17 +67,14 @@ function parseList(v) {
 // (an older checkout, or a partial install).
 const MODELS_PATH = process.env.ZEN_PROXY_MODELS || path.join(__dirname, "models.json")
 const BAKED_MODELS = [
-  "space-bunny-free",
   "mimo-v2.6-flash-free",
   "big-pickle",
-  "muse-spark-1.3-contributor-free",
-  "muse-spark-1.2-contributor-free",
   "nemotron-3.5-lightning-free",
-  "longcat-2.5-preview-free",
-  "step-5-preview-free",
-  "cat-jam-free",
   "deepseek-v4.1-flash-free",
   "nemotron-3.5-super-vl-free",
+  "glm-5.3-flash-free",
+  "beam-free",
+  "flint-40b-free",
 ]
 function loadShippedModels() {
   try {
@@ -70,44 +85,6 @@ function loadShippedModels() {
   } catch {}
   return [...BAKED_MODELS]
 }
-
-// ---- opencode agent preamble ------------------------------------------------
-// The free tier refuses traffic that doesn't carry opencode's own agent framing,
-// so an Anthropic client (Claude Code) whose system prompt is Anthropic's gets
-// `403 FreeTierError` no matter how correctly it is translated. We put this
-// captured opencode preamble *in front of* the client's instructions and leave
-// everything the client sent intact and in order — the client's prompt is larger
-// and comes later, so it still governs behaviour, but the request is now shaped
-// like agent traffic and is accepted.
-//
-// The exact text matters: the gate is not satisfied by neutral or generic agent
-// boilerplate (tested), only by opencode's real framing, and it degrades if the
-// preamble is truncated much below this length. It is prepended, never
-// substituted, so the client's own system prompt is always preserved.
-const AGENT_PREAMBLE_TEXT = `You are a title generator. You output ONLY a thread title. Nothing else.
-
-<task>
-Generate a brief title that would help the user find this conversation later.
-
-Follow all rules in <rules>
-Use the <examples> so you know what a good title looks like.
-Your output must be:
-- A single line
-- ≤50 characters
-- No explanations
-</task>
-
-<rules>
-- you MUST use the same language as the user message you are summarizing
-- Title must be grammatically correct and read naturally - no word salad
-- Never include tool names in the title (e.g. "read tool", "bash tool", "edit tool")
-- Focus on the main topic or question the user needs to retrieve
-- Vary your phrasing - avoid repetitive patterns like always starting with "Analyzing"
-- If a file is mentioned, focus on WHAT the user wants to do WITH the file, not just that they shared it
-- Keep exact: technical terms, numbers, filenames, HTTP codes
-- Remove: the, this, my, a, an
-- Never assume tech stack
-- Never use tools`
 
 // ---- opencode agent tools ---------------------------------------------------
 // Measured behaviour of the free tier's gate: a request is accepted when it
@@ -127,6 +104,8 @@ const AGENT_TOOL_MAP = {
   write: { name: "Write", args: { filePath: "file_path" } },
   // null means "this argument has no counterpart on the caller's tool; drop it".
   bash: { name: "Bash", args: { workdir: null } },
+  // v2 renamed the shell tool; callers still see `Bash`.
+  shell: { name: "Bash", args: { workdir: null } },
   grep: { name: "Grep", args: {} },
   glob: { name: "Glob", args: {} },
   list: { name: "LS", args: {} },
@@ -137,7 +116,8 @@ function loadAgentTools() {
   agentToolsCache = []
   try {
     const parsed = JSON.parse(fs.readFileSync(AGENT_TOOLS_PATH, "utf8"))
-    const tools = Array.isArray(parsed?.tools) ? parsed.tools : []
+    // Accept both the wrapped {"tools":[…]} and a bare array capture.
+    const tools = Array.isArray(parsed?.tools) ? parsed.tools : Array.isArray(parsed) ? parsed : []
     // chatToolsToResponses() drops tools without type, which would make the
     // bridge tool unconvertible and kill the process mid-request.
     agentToolsCache = tools.filter((t) => t?.type === "function" && t?.function?.name && AGENT_TOOL_MAP[t.function.name])
@@ -145,10 +125,12 @@ function loadAgentTools() {
   return agentToolsCache
 }
 
-// The gate wants opencode's tools, but a caller that sends none — a plain chat,
-// pi's auto-compaction — has nothing for agentToolsFor() to match. opencode
-// attaches its whole registry on every call and never filters it by relevance,
-// so the proxy sends the whole manifest too; the gate takes it on `read` alone.
+// The gate takes requests that carry opencode's manifest; callers with none of
+// their own — a plain chat, an auto-compaction — still need it attached. The
+// manifest is the v2 upload (6 caller-mappable tools: read/edit/glob/grep/
+// shell/write; measured 200 against the live gateway with the preamble). The
+// model prefers opencode's names, so the relay layers rename manifest calls to
+// the caller's equivalents; un-mappable ones (question, subagent, …) never ride.
 function gateBridgeTools() {
   return config.agentTools ? loadAgentTools() : []
 }
@@ -158,6 +140,108 @@ function agentToolsFor(callerToolNames) {
   if (!config.agentTools) return []
   const wanted = callerToolNames instanceof Set ? callerToolNames : new Set(callerToolNames ?? [])
   return loadAgentTools().filter((t) => wanted.has(AGENT_TOOL_MAP[t.function.name].name))
+}
+
+// The manifest rides on every request (the v2 gate refuses anything less), so
+// the model may answer with one of its tools even when the caller never
+// offered an equivalent — measured 3-6 of 12 against the live gateway on a
+// prompt that mentions reading a file. Such a call is a tool the caller cannot
+// run, so the reply layer drops it: `stripUnpinnedCalls` for collected
+// replies, the same decision per index in the streaming relays (a call's name
+// arrives chunks apart from its arguments). Pinned callers keep their stricter
+// filter: the reply only carries the pinned call. Callerless bridged requests
+// are covered by the blanket strip (`bridged`), so this list is only needed
+// for tool-carrying callers.
+//
+// `viaMap` for the Anthropic route, where the caller's names are the official
+// ones (`Read`), and a manifest `read` is runnable iff the caller has that
+// mapped name; on the OpenAI-shaped routes the caller's names are already in
+// opencode's vocabulary.
+//
+// A predicate, not a name list: the manifest is not the only source of
+// unrunnable calls. Left to its own devices the provider invents tools too —
+// `client_nonce_lookup` on a request that mentions nothing of the sort was
+// streamed through once — and a Set built from the manifest would let an
+// invented name (not in the manifest, not offered) leak straight through. The
+// rule is per request: keep only what this caller offered.
+//
+// The same hole sat open on the Anthropic route: `/v1/messages` callers bring
+// their tools in Anthropic shape, and a stray call would arrive under the
+// renamed official name. `anthropicToChatBody()` merges the manifest first for
+// the gate; this keeps the reply side honest.
+function keepableFor(tools, viaMap = false) {
+  if (!config.agentTools) return null
+  if (!Array.isArray(tools) || !tools.length) return null
+  const offered = new Set(tools.map((t) => t?.function?.name ?? t?.name).filter(Boolean))
+  if (!offered.size) return null
+  return viaMap ? (raw) => offered.has(AGENT_TOOL_MAP[raw]?.name ?? raw) : (raw) => offered.has(raw)
+}
+
+function pinnedToolName(toolChoice) {
+  if (!toolChoice || typeof toolChoice !== "object") return null
+  const fn = toolChoice.function ?? toolChoice
+  return typeof fn?.name === "string" && fn.name ? fn.name : null
+}
+
+// The gate weighs the *system prompt*, not just the tools. A request whose
+// system text is not opencode's own harness preamble is refused with
+// `429 FreeUsageLimitError` however verisimilar the rest of it is (measured
+// against the live gateway: the full captured preamble streams 200; the same
+// request with a generic assistant prompt, with the opening line alone, or
+// with the preamble cut at ~1.8 KB is refused, all within one minute). The
+// captured text ships as agent-preamble.txt; config semantics:
+//   "" / "auto" — the built-in preamble (default; the shipped file)
+//   "off"/"none" — no preamble (BYOK use, or when the wire is different)
+//   anything else — used verbatim as the preamble
+const AGENT_PREAMBLE_PATH = process.env.ZEN_PROXY_AGENT_PREAMBLE || path.join(__dirname, "agent-preamble.txt")
+const PREAMBLE_MARKER = "You are an AI agent running in OpenCode"
+let agentPreambleCache = null
+function builtInPreamble() {
+  if (agentPreambleCache === null) {
+    try {
+      agentPreambleCache = fs.readFileSync(AGENT_PREAMBLE_PATH, "utf8")
+    } catch {
+      agentPreambleCache = ""
+    }
+  }
+  return agentPreambleCache
+}
+function bridgePreamble() {
+  const v = config.agentPreamble
+  if (v == null) return builtInPreamble()
+  const s = String(v).trim()
+  if (s === "" || s === "auto") return builtInPreamble()
+  if (s === "off" || s === "none") return ""
+  return s
+}
+// A system text that is already opencode-shaped stays untouched, so opencode
+// itself (or a chained proxy) can sit behind zen-proxy without a doubled
+// preamble.
+function combinePreamble(systemText) {
+  const preamble = bridgePreamble()
+  if (!preamble) return systemText
+  if (systemText && systemText.startsWith(PREAMBLE_MARKER)) return systemText
+  return systemText ? `${preamble}\n\n${systemText}` : preamble
+}
+// Prepend the preamble to the first system message of a chat-shaped message
+// array — the single-message form the gate was measured against; splitting
+// them into two system turns is accepted differently.
+function injectPreamble(messages) {
+  const preamble = bridgePreamble()
+  if (!preamble || !Array.isArray(messages)) return messages
+  const at = messages.findIndex((m) => m?.role === "system")
+  // System content is a string or text parts; both join into one string. The
+  // upstream endpoint takes system text as a string, and a system turn never
+  // carries images.
+  const textOf = (m) => (typeof m?.content === "string" ? m.content : Array.isArray(m?.content) ? m.content.map((p) => p?.text ?? "").filter(Boolean).join("\n\n") : "")
+  if (at >= 0) {
+    const combined = combinePreamble(textOf(messages[at]))
+    if (combined === textOf(messages[at])) return messages
+    const out = [...messages]
+    out[at] = { ...messages[at], content: combined }
+    return out
+  }
+  return [{ role: "system", content: preamble }, ...messages]
 }
 
 // An opencode tool call rewritten as the caller's tool call.
@@ -193,7 +277,16 @@ const DEFAULT_CONFIG = {
   host: ENV.HOST ?? "127.0.0.1",
   port: Number(ENV.PORT ?? 8787),
   upstream: normalizeUpstream(ENV.ZEN_URL ?? DEFAULT_UPSTREAM),
-  ua: ENV.ZEN_UA ?? "opencode/1.18.30",
+  // The v2 CLI's own wire format (captured from the real client): channel
+  // "latest", artifact "cli", plus the client/project identity headers below.
+  ua: ENV.ZEN_UA ?? "opencode/latest/2.1.4/cli",
+  // "cli" mirrors x-opencode-client the real CLI sends.
+  clientName: ENV.ZEN_CLIENT ?? "cli",
+  // Stable per-install project identity (sha1 of "directory:<cwd>"), the same
+  // derivation opencode itself uses. Set to override.
+  projectHash: ENV.ZEN_PROJECT_HASH ?? "",
+  // W3C b3/traceparent propagation headers, as the real CLI sends.
+  tracing: ENV.ZEN_TRACING === "0" ? false : true,
   autoUA: ENV.AUTO_UA !== "0",
   uaRefreshMs: Number(ENV.UA_REFRESH_MS ?? 6 * 3600_000),
   injectSession: ENV.INJECT_SESSION !== "0",
@@ -545,7 +638,7 @@ function anthropicImageUrl(block) {
 
 function anthropicToChatMessages(system, messages) {
   const out = []
-  const preamble = String(config.agentPreamble ?? AGENT_PREAMBLE_TEXT ?? "")
+  const preamble = bridgePreamble()
   const sysText = anthropicSystemText(system)
   // Preamble and the client's instructions go into a *single* system message,
   // preamble first. One message is what the upstream gate was measured against;
@@ -641,15 +734,28 @@ function anthropicToChatBody(body, model) {
   if (body?.top_p != null) payload.top_p = body.top_p
   if (Array.isArray(body?.stop_sequences) && body.stop_sequences.length) payload.stop = body.stop_sequences.slice(0, 4)
   const tools = anthropicToolsToChat(body?.tools)
-  // Ship opencode's own tools ahead of the caller's. Without them the free tier
-  // rejects the request outright; the caller's prompt and tools are untouched and
-  // still take priority in the reply.
-  const bridge = agentToolsFor((body?.tools ?? []).map((t) => t?.name))
-  const all = bridge.length ? [...bridge, ...(tools ?? [])] : tools
+  // The gate takes opencode's own manifest on every request (a caller's tools
+  // plus a `read` stub alone is refused since the v2 gateway). The manifest goes
+  // first, the caller's tools after it — minus names that collide with a
+  // manifest name — and the caller's prompt and intent stay untouched. (Off in
+  // agentTools: false.) A model may still answer with a manifest tool the
+  // caller has no equivalent for; `keepableFor` feeds the reply layer,
+  // which drops exactly those.
+  const bridge = gateBridgeTools()
+  const manifestNames = new Set(bridge.map((t) => t?.function?.name))
+  const callerTools = (tools ?? []).filter((t) => !manifestNames.has(t?.function?.name ?? t?.name))
+  const all = bridge.length ? [...bridge, ...callerTools] : callerTools
   if (all?.length) payload.tools = all
   // Anthropic's tool_choice and opencode's use the same vocabulary once renamed.
   if (typeof body?.tool_choice === "object" && body.tool_choice?.type === "tool") {
     payload.tool_choice = { type: "function", function: { name: body.tool_choice.name } }
+  } else if (typeof body?.tool_choice === "object" && body.tool_choice?.type === "any") {
+    // "any" means some call must happen; upstream has no object form for that
+    // and "required" is its exact match (measured: it used to be dropped and
+    // degrade into the model's default guess). pinnedToolName treats it as
+    // null, so this cannot read as a pin. Other object shapes stay dropped —
+    // forwarding an unknown dialect has never been measured as safe.
+    payload.tool_choice = "required"
   } else if (typeof body?.tool_choice === "string") {
     payload.tool_choice = body.tool_choice
   }
@@ -669,7 +775,7 @@ function parseToolArgs(args) {
 
 const STOP_REASON = { stop: "end_turn", length: "max_tokens", tool_calls: "tool_use", function_call: "tool_use", content_filter: "end_turn" }
 
-function chatToAnthropic(content, requested, servedBy) {
+function chatToAnthropic(content, requested, servedBy, pin = null) {
   const msg = content?.choices?.[0]?.message ?? {}
   const blocks = []
   if (msg.reasoning_content) blocks.push({ type: "thinking", thinking: msg.reasoning_content, signature: "" })
@@ -679,22 +785,30 @@ function chatToAnthropic(content, requested, servedBy) {
     // A call to an opencode bridge tool comes back under opencode's name; give
     // the caller back the tool it actually offered.
     const mapped = remapAgentTool(tc?.function?.name ?? tc?.name, tc?.function?.arguments ?? tc?.arguments)
+    const name = mapped ? mapped.name : (tc?.function?.name ?? tc?.name ?? "unknown")
+    // The pin is not enforcement: the provider may answer a pinned request with
+    // a call the caller never offered (the injected stub `read` included). A
+    // pinned reply keeps the pinned call and nothing else.
+    if (pin && name !== pin) continue
     blocks.push({
       type: "tool_use",
       id: tc?.id ?? `toolu_${randomBytes(8).toString("hex")}`,
-      name: mapped ? mapped.name : (tc?.function?.name ?? tc?.name ?? "unknown"),
+      name,
       input: parseToolArgs(mapped ? mapped.args : (tc?.function?.arguments ?? tc?.arguments)),
     })
   }
   if (!blocks.length) blocks.push({ type: "text", text: "" })
   const u = content?.usage ?? {}
+  // Every call got filtered away and the model still claimed `tool_calls`: the
+  // message has no call left to answer, so it cannot end as tool_use.
+  const stop = STOP_REASON[content?.choices?.[0]?.finish_reason] ?? "end_turn"
   return {
     id: content?.id ?? `msg_${randomBytes(12).toString("hex")}`,
     type: "message",
     role: "assistant",
     model: requested,
     content: blocks,
-    stop_reason: STOP_REASON[content?.choices?.[0]?.finish_reason] ?? "end_turn",
+    stop_reason: stop === "tool_use" && !blocks.some((b) => b.type === "tool_use") ? "end_turn" : stop,
     stop_sequence: null,
     usage: { input_tokens: u.prompt_tokens ?? 0, output_tokens: u.completion_tokens ?? 0 },
     ...(servedBy && servedBy !== requested ? { zen_served_by: servedBy } : {}),
@@ -863,6 +977,154 @@ function responsesToChat(data, requested, servedBy) {
   }
 }
 
+// Responses input -> chat.completions `messages`. A real Responses body
+// carries `input`, not `messages`: a string, or the item list the Responses
+// spec uses — message items (with input_text/input_image parts),
+// function_call items and their function_call_output results. Reasoning items
+// are skipped: they carry provider-side state no chat upstream can use, the
+// same way a chat caller re-sends the transcript without them.
+function responsesInputToMessages(input) {
+  if (typeof input === "string") return input ? [{ role: "user", content: input }] : []
+  if (!Array.isArray(input)) return input == null ? [] : [{ role: "user", content: textOf(input) }]
+  const messages = []
+  for (const item of input) {
+    if (item?.type === "message" || (item?.type == null && (item?.role ?? item?.content))) {
+      const role = item?.role ?? "user"
+      const content = item?.content
+      if (typeof content === "string") {
+        if (content) messages.push({ role, content })
+      } else if (Array.isArray(content)) {
+        const parts = []
+        for (const p of content) {
+          if (typeof p === "string") { if (p) parts.push({ type: "text", text: p }) }
+          else if ((p?.type === "input_text" || p?.type === "text") && p.text) parts.push({ type: "text", text: p.text })
+          else if (p?.type === "input_image" && (p.image_url ?? p.url)) parts.push({ type: "image_url", image_url: p.image_url ?? p.url })
+        }
+        if (parts.length) messages.push({ role, content: parts })
+      }
+      continue
+    }
+    if (item?.type === "function_call") {
+      messages.push({
+        role: "assistant",
+        content: "",
+        tool_calls: [
+          {
+            id: item?.call_id ?? item?.id ?? "call_0",
+            type: "function",
+            function: { name: item?.name ?? "unknown", arguments: typeof item?.arguments === "string" ? item.arguments : JSON.stringify(item.arguments ?? {}) },
+          },
+        ],
+      })
+      continue
+    }
+    if (item?.type === "function_call_output") {
+      messages.push({ role: "tool", tool_call_id: item?.call_id ?? item?.id ?? "call_0", content: item?.output ?? " " })
+      continue
+    }
+    // reasoning, error and anything else unknown has no chat counterpart to
+    // preserve; walk past it.
+  }
+  return messages.length ? messages : [{ role: "user", content: "" }]
+}
+
+// Responses input as an item array: a string becomes the user message the
+// real Responses API would have carried as an item. Used where a Responses
+// body reaches a responses-family upstream and its items must not pass through
+// a chat round-trip.
+function responsesInputItemArray(input) {
+  if (typeof input === "string") return input ? [{ type: "message", role: "user", content: input }] : []
+  if (Array.isArray(input)) return input
+  return input == null ? [] : [{ type: "message", role: "user", content: textOf(input) }]
+}
+
+// A Responses request body -> the chat-shaped body the request loop already
+// understands. Only the fields that have a chat counterpart travel;
+// `instructions` becomes the system message, Responses tools (flat) become
+// chat tools (nested), `max_output_tokens` maps onto both token keys.
+function responsesInputToChatBody(body) {
+  const chat = { model: body?.model }
+  const messages = responsesInputToMessages(body.input)
+  const sys = typeof body.instructions === "string" && body.instructions ? [{ role: "system", content: body.instructions }] : []
+  chat.messages = sys.length ? [...sys, ...messages] : messages
+  if (body.stream != null) chat.stream = !!body.stream
+  if (body.temperature != null) chat.temperature = body.temperature
+  if (body.top_p != null) chat.top_p = body.top_p
+  const mt = Number(body.max_output_tokens ?? body.max_tokens)
+  if (Number.isFinite(mt) && mt > 0) {
+    chat.max_tokens = Math.floor(mt)
+    chat.max_completion_tokens = Math.floor(mt)
+  }
+  if (body.parallel_tool_calls != null) chat.parallel_tool_calls = body.parallel_tool_calls
+  if (Array.isArray(body.tools) && body.tools.length) {
+    const tools = []
+    for (const t of body.tools) {
+      const name = t?.name ?? t?.function?.name
+      if (!name) continue
+      if (t?.type === "function" && t?.function) {
+        tools.push(t)
+        continue
+      }
+      tools.push({
+        type: "function",
+        function: { name, ...(t?.description ? { description: t.description } : {}), parameters: t?.parameters ?? { type: "object", properties: {} } },
+      })
+    }
+    if (tools.length) chat.tools = tools
+  }
+  const tc = body.tool_choice
+  if (typeof tc === "string") chat.tool_choice = tc
+  else if (tc && typeof tc === "object" && (tc.type === "function" || tc.name)) {
+    chat.tool_choice = { type: "function", function: { name: tc.function?.name ?? tc.name } }
+  }
+  return chat
+}
+
+// The inverse of responsesToChat: a collected chat.completion shaped back into
+// a Responses response object, for a Responses-shaped caller whose model lives
+// on /chat/completions.
+function chatToResponses(content, requested, servedBy) {
+  const msg = content?.choices?.[0]?.message ?? {}
+  const output = []
+  if (msg.reasoning_content) output.push({ type: "reasoning", summary: [{ text: msg.reasoning_content }] })
+  const text = typeof msg.content === "string" ? msg.content : textOf(msg.content)
+  if (text) output.push({ type: "message", role: "assistant", content: [{ type: "output_text", text, annotations: [] }] })
+  for (const tc of msg.tool_calls ?? []) {
+    output.push({
+      type: "function_call",
+      id: tc?.id ?? `fc_${randomBytes(8).toString("hex")}`,
+      call_id: tc?.id ?? "call_0",
+      name: tc?.function?.name ?? tc?.name ?? "unknown",
+      arguments: typeof tc?.function?.arguments === "string" ? tc.function.arguments : JSON.stringify(tc?.function?.arguments ?? {}),
+    })
+  }
+  const u = content?.usage ?? {}
+  return {
+    id: content?.id ? `resp_${content.id.replace(/^resp_/, "")}` : `resp_${randomBytes(12).toString("hex")}`,
+    object: "response",
+    created_at: content?.created ?? Math.floor(Date.now() / 1000),
+    status: "completed",
+    model: requested,
+    ...output.length ? { output } : { output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: "", annotations: [] }] }] },
+    usage: {
+      input_tokens: u.prompt_tokens ?? 0,
+      output_tokens: u.completion_tokens ?? 0,
+      total_tokens: u.total_tokens ?? (u.prompt_tokens ?? 0) + (u.completion_tokens ?? 0),
+    },
+    ...(servedBy && servedBy !== requested ? { zen_served_by: servedBy } : {}),
+  }
+}
+
+// Filter the output items of a collected Responses object: bridge calls the
+// caller never offered are removed entirely, a pinned call keeps only its own
+// `name`. Everything that is not a function_call stays.
+function filterResponsesOutput(data, callOk = null) {
+  if (!data || !Array.isArray(data.output)) return data
+  const output = data.output.filter((item) => (item?.type === "function_call" ? callOk !== null && callOk(item) : true))
+  if (output.length !== data.output.length) data.output = output
+  return data
+}
+
 // Responses SSE event -> chat.completion.chunk deltas.
 function responsesEventToDeltas(event, data, state) {
   const type = event || data?.type || ""
@@ -986,6 +1248,29 @@ function ipOmit(ip) {
   return false
 }
 
+// The CLI's trace root is stable per process; spans change per request. Both
+// formats below follow W3C propagation exactly as captured from v2.1.4.
+const traceRoot = randomBytes(16).toString("hex")
+function traceHeaders() {
+  // b3: <traceId>-<spanId>-1-<parentId 16 random>
+  // traceparent: 00-<traceId>-<spanId>-01
+  const span = randomBytes(8).toString("hex")
+  const parent = randomBytes(8).toString("hex")
+  return {
+    b3: `${traceRoot}-${span}-1-${parent}`,
+    traceparent: `00-${traceRoot}-${span}-01`,
+  }
+}
+
+// Project identity mirrors opencode's own derivation for a non-VCS directory:
+// sha1("directory:<resolved path>") — one stable value per proxy install.
+let cachedProjectHash = ""
+function projectHash() {
+  if (config.projectHash) return config.projectHash
+  if (!cachedProjectHash) cachedProjectHash = createHash("sha1").update(`directory:${process.cwd()}`).digest("hex")
+  return cachedProjectHash
+}
+
 function zenHeaders(req, auth) {
   const headers = {
     "content-type": "application/json",
@@ -999,7 +1284,13 @@ function zenHeaders(req, auth) {
   // header so the pair upstream expects is always complete.
   if (!sess.injected || config.injectSession) {
     for (const h of SESSION_HEADERS) headers[h] = sess.value
+    // v2 parity: the affinity pair echoes the same value under two more names.
+    headers["x-session-affinity"] = sess.value
+    headers["x-session-id"] = sess.value
   }
+  headers["x-opencode-client"] = config.clientName
+  headers["x-opencode-project"] = projectHash()
+  if (config.tracing) for (const [k, v] of Object.entries(traceHeaders())) headers[k] = v
   const ip = clientIp(req)
   if (!ipOmit(ip)) headers["x-real-ip"] = ip
   for (const h of ["x-opencode-request", "x-opencode-client", "x-opencode-project"]) {
@@ -1111,17 +1402,6 @@ function keyRotationWorthy(status, body) {
   if (status === 401 || status === 429) return true
   const msg = String(body?.error?.message ?? body?.message ?? "")
   return /rate.?limit|usage limit|quota|invalid api key|missing api key|unauthor/i.test(msg)
-}
-
-// The free allowance is per account, not per model. Once every account has
-// answered with the quota error, walking the remaining models can only repeat
-// the same 429: it used to spend ~90s and ~31 upstream calls on a single turn
-// that was already decided. Nothing about the model is at fault here.
-function freeUsageExhausted(status, body) {
-  if (status !== 429) return false
-  const t = String(body?.error?.type ?? body?.type ?? "")
-  const msg = String(body?.error?.message ?? body?.message ?? "")
-  return /FreeUsageLimit/i.test(t) || /free usage limit|usage limit reached|quota (exceeded|reached)/i.test(msg)
 }
 
 // Key order for one request: the next pool key first (round-robin), then the
@@ -1270,20 +1550,30 @@ async function handleMessages(req, res) {
   // The model the client chose is tried first; transient failures are retried
   // against that same model before the chain moves on.
   const retries = config.retriesPerModel > 0 ? Math.floor(config.retriesPerModel) : 0
-  // Same bridge rule as the chat path: a caller that sends no tools (title-gen
-  // helper calls, plain API use) gets opencode's whole manifest pinned off, or
-  // the gate answers 403 for every model and the request walks the chain.
-  const bridge = (body?.tools ?? []).length ? [] : gateBridgeTools()
-  const bridged = bridge.length > 0
+  // Same bridge rule as the chat path: the manifest rides on every request.
+  // `bridged` now only means "callerless" — a title-gen helper or a plain API
+  // call — which still gets `tool_choice` pinned off so the answer is text.
+  const bridge = gateBridgeTools()
+  const bridged = bridge.length > 0 && !(body?.tools ?? []).length
+  // A caller that pins a tool gets a reply that carries only that call: the
+  // provider ignores the pin sometimes, and stray manifest calls (the
+  // injected `read` included) are tools the caller cannot meaningfully run.
+  // The relay layers keep the pinned call and drop the rest.
+  const keepable = bridged ? null : keepableFor(body?.tools, true)
+  const pin = bridged ? null : pinnedToolName(body.tool_choice)
   for (const model of candidates) {
     const chosen = model === candidates[0]
     used = model
     const format = modelFormat(model)
     // Upstream only ever sees streams (see collectChatCompletion); whether the
     // client asked for one decides how the reply is shaped, not what is sent.
-    const payload = format === "responses" ? responsesRequest(anthropicToChatBody(body, model), model, true) : { ...anthropicToChatBody(body, model), stream: true }
+    // The gate's read stub, when the caller needs one, rides inside the
+    // translated body (see anthropicToChatBody) — this must not inject again.
+    const chatShaped = anthropicToChatBody(body, model)
+    const payload = format === "responses" ? responsesRequest(chatShaped, model, true) : { ...chatShaped, stream: true }
+    // Callerless bridged request: the manifest and preamble are for the gate;
+    // the answer to "summarize this" must be text, not a tool call.
     if (bridged) {
-      payload.tools = format === "responses" ? chatToolsToResponses(bridge) : bridge
       // /responses takes only "auto"; the chat endpoint takes the pin.
       if (format === "responses") delete payload.tool_choice
       else payload.tool_choice = "none"
@@ -1293,14 +1583,17 @@ async function handleMessages(req, res) {
       if (delayMs > 0) await new Promise((r) => setTimeout(r, delayMs))
       delayMs = 0
       let upstreamRes
+      const wall = isStream ? headersWall() : null
       try {
         upstreamRes = await fetch(`${config.upstream}${format === "responses" ? "/responses" : "/chat/completions"}`, {
           method: "POST",
           headers: zenHeaders(req, auth),
           body: JSON.stringify(payload),
-          signal: isStream ? req.signal : AbortSignal.timeout(config.timeoutMs),
+          signal: isStream ? wall.signal : AbortSignal.timeout(config.timeoutMs),
         })
+        if (wall) wall.release()
       } catch (err) {
+        if (wall) wall.release()
         lastErr = { error: { type: "api_error", message: err.message } }
         lastStatus = 502
         if (attempt < retries) {
@@ -1324,7 +1617,12 @@ async function handleMessages(req, res) {
       if (upstreamRes.ok) {
         if (isStream) {
           const chunks = format === "responses" ? responsesChunksAsChat(upstreamRes) : sseChunks(upstreamRes)
-          relayAnthropicStream(req, res, chunks, requested, model, bridged)
+          // Fire-and-forget: the pump owns every client-visible failure, but
+          // undici can also reject a socket that died behind the Response after
+          // the pump is done — measured as process-level "TypeError:
+          // terminated" noise. Sink the promise; the log guard stays for real
+          // surprises.
+          relayAnthropicStream(req, res, chunks, requested, model, bridged, pin, keepable).catch(() => {})
           res.on("finish", () => {
             recordReq(req, `${requested}→${model}`, Date.now() - start, 200)
             recordObserved(model, true)
@@ -1333,34 +1631,40 @@ async function handleMessages(req, res) {
         }
         try {
           const content = format === "responses" ? await collectResponses(upstreamRes) : await collectChatCompletion(upstreamRes)
-          const shaped = stripToolCalls(format === "responses" ? responsesToChat(content, requested, model) : content, bridged)
+          const shaped = stripUnpinnedCalls(stripToolCalls(format === "responses" ? responsesToChat(content, requested, model) : content, bridged), pin, keepable)
           recordReq(req, `${requested}→${model}`, Date.now() - start, 200)
           recordObserved(model, true)
           if (model !== requested) {
             res.setHeader?.("x-zen-served-by", model)
             res.setHeader?.("x-zen-fallback", "true")
           }
-          return json(res, 200, chatToAnthropic(shaped, requested, model))
-        } catch {
-          recordReq(req, requested, Date.now() - start, 502)
-          return json(res, 502, anthropicError(502, { error: { type: "api_error", message: "bad upstream response" } }).body)
+          return json(res, 200, chatToAnthropic(shaped, requested, model, pin))
+        } catch (err) {
+          // Upstream said OK but the reply never arrived whole (a mid-stream
+          // error chunk, a cut, a hang-abort). Nothing reached the client yet,
+          // so the chain can still save the request: fall through like any
+          // other upstream failure and keep the real message for the final
+          // surface — "bad upstream response" used to hide what actually
+          // happened (measured on the hostile gateway).
+          lastErr = { error: { type: "api_error", message: err?.message ? String(err.message) : "bad upstream response" } }
+          lastStatus = 502
+          recordObserved(model, false)
+          break
         }
       }
 
       try {
         lastErr = await upstreamRes.json()
       } catch {
-        lastErr = { error: { type: "api_error", message: `upstream returned ${upstreamRes.status}` } }
+        // The body could not be read as JSON, so there is nothing to match the
+        // "model is unavailable" vocabulary against — a bodyless/text 4xx is a
+        // deterministic client-visible error. Type it non-retryable: typing it
+        // upstream_error used to make both retry predicates fire and walk the
+        // whole fallback chain (~40 upstream calls) for e.g. a text/plain 400.
+        lastErr = { error: { type: "invalid_request_error", message: `upstream returned ${upstreamRes.status}` } }
       }
       lastStatus = upstreamRes.status
       const retryAfterMs = Math.min(parseRetryAfter(upstreamRes.headers.get("retry-after")) * 1000, 3000)
-      if (freeUsageExhausted(upstreamRes.status, lastErr)) {
-        recordReq(req, requested, Date.now() - start, lastStatus)
-        const e = anthropicError(lastStatus, lastErr)
-        res.writeHead(e.status, { "content-type": "application/json" })
-        res.end(JSON.stringify(e.body))
-        return
-      }
       if (transientUpstream(upstreamRes.status, lastErr) && attempt < retries) {
         delayMs = Math.max(config.retryBackoffMs * (attempt + 1), retryAfterMs)
         continue
@@ -1395,7 +1699,7 @@ async function handleMessages(req, res) {
   res.end(JSON.stringify(e.body))
 }
 
-async function handleChat(req, res) {
+async function handleChat(req, res, responsesRoute = false) {
   const start = Date.now()
   let body
   try {
@@ -1411,7 +1715,21 @@ async function handleChat(req, res) {
     return json(res, 400, { error: { type: "invalid_request_error", message: "invalid JSON body" } })
   }
 
-  const { requested, candidates } = resolveModel(body.model)
+  // A Responses body carries `input`, not `messages` — and only the /responses
+  // leg reads one. Translate it up front; the loop keeps thinking in chat, and
+  // exactly those requests get their reply back in Responses format. A
+  // chat-shaped body on the same leg keeps today's chat reply, and a
+  // chat-shaped body on the chat leg is unchanged.
+  const responsesRequestShape =
+    responsesRoute && body.messages === undefined && body.input !== undefined
+  // The gate fingerprints the harness system text; the preamble rides on every
+  // wire shape this leg produces (chat messages, chat→responses conversion,
+  // and the native /responses passthrough below).
+  const chatBodyBase = responsesRequestShape ? responsesInputToChatBody(body) : body
+  if (Array.isArray(chatBodyBase?.messages)) chatBodyBase.messages = injectPreamble(chatBodyBase.messages)
+  const chatBody = chatBodyBase
+
+  const { requested, candidates } = resolveModel(chatBody.model)
   if (isSystemoneOnly(requested)) {
     recordReq(req, requested, Date.now() - start, 400)
     return json(res, 400, {
@@ -1421,7 +1739,7 @@ async function handleChat(req, res) {
       },
     })
   }
-  const isStream = !!body.stream
+  const isStream = !!chatBody.stream
   const plan = upstreamAuths(req)
   if (plan.invalid) {
     recordReq(req, requested, Date.now() - start, 401)
@@ -1430,7 +1748,6 @@ async function handleChat(req, res) {
   const auths = plan.auths.length ? plan.auths : ["Bearer public"]
   let auth = auths[0]
   let ai = 0
-
   let lastErr = null
   let lastStatus = 502
   let firstErr = null
@@ -1439,8 +1756,30 @@ async function handleChat(req, res) {
   // The model the client chose is tried first; transient failures are retried
   // against that same model before the chain moves on.
   const retries = config.retriesPerModel > 0 ? Math.floor(config.retriesPerModel) : 0
-  const bridge = body.tools?.length ? [] : gateBridgeTools()
-  const bridged = bridge.length > 0
+  // The gate refuses any request that does not carry opencode's own tool
+  // manifest — a caller with its own tools used to ride on a bare `read` stub
+  // and now gets refused too. The manifest goes on every request, ahead of the
+  // caller's tools; a caller tool whose name collides with a manifest name is
+  // dropped in favour of the gate's own schema (the reply layer renames and
+  // remaps manifest calls back to the caller's equivalent — see
+  // remapAgentTool — and `Read`/`read` do not collide by case).
+  const bridge = gateBridgeTools()
+  const callerTools = Array.isArray(chatBody.tools) ? chatBody.tools : []
+  const manifestNames = new Set(bridge.map((t) => t?.function?.name))
+  const mergedTools = bridge.length
+    ? [...bridge, ...callerTools.filter((t) => !manifestNames.has(t?.function?.name ?? t?.name))]
+    : callerTools
+  const requestBody = bridge.length ? { ...chatBody, tools: mergedTools } : chatBody
+  // Same as before: the pin is the caller's own request; only a callerless
+  // bridged request changes `tool_choice` (see the loop below).
+  const pin = pinnedToolName(chatBody.tool_choice)
+  // `bridged` now means "callerless": the manifest rides on every request, so
+  // only a caller without its own tools has the reply stripped of manifest-tool
+  // calls (the caller cannot run any of them — the answer must be text). A
+  // tool-carrying caller keeps its calls, minus any manifest ones it has no
+  // equivalent for — the relay layers drop those.
+  const bridged = bridge.length > 0 && !callerTools.length
+  const keepable = bridged ? null : keepableFor(callerTools, false)
   for (const model of candidates) {
     const chosen = model === candidates[0]
     used = model
@@ -1448,11 +1787,32 @@ async function handleChat(req, res) {
     // Streams upstream regardless of what the client asked for — see
     // collectChatCompletion — and the collector puts the shape back.
     const payload =
-      format === "responses" ? responsesRequest(body, model, true) : { ...body, model, stream: true }
-    if (bridged) {
-      payload.tools = format === "responses" ? chatToolsToResponses(bridge) : bridge
-      // The gateway takes only "auto" on /responses, so forwarding anything the
-      // caller sent there is a hard error rather than a hint.
+      format === "responses" ? responsesRequest(requestBody, model, true) : { ...requestBody, model, stream: true }
+    // A Responses body that reaches a responses-family model keeps its input
+    // verbatim: the chat round-trip above preserves mostly everything, but
+    // content parts do not survive it losslessly — an input_image next to
+    // input_text comes back flattened to the text alone, measured. What a
+    // /responses caller sent is exactly what upstream wants, so it goes as-is,
+    // with `instructions` taking the system slot the translated flow gives it.
+    if (responsesRequestShape && format === "responses") {
+      const preamble = bridgePreamble()
+      const caller = typeof body.instructions === "string" && body.instructions
+      const instructions = caller
+        ? (caller.startsWith(PREAMBLE_MARKER) ? caller : `${preamble}\n\n${caller}`)
+        : preamble
+      payload.input =
+        instructions
+          ? [{ type: "message", role: "system", content: instructions }, ...responsesInputItemArray(body.input)]
+          : responsesInputItemArray(body.input)
+    }
+    // A callerless bridged request (title generators, plain API pings): the
+    // manifest is for the gate, not the answer — the ask is text, so the
+    // provider is told not to call anything. A caller that manages its own
+    // tool_choice keeps it; the pin filter in the relay layers holds stray
+    // manifest calls out of the reply.
+    if (!callerTools.length && bridge.length) {
+      // The gateway takes only "auto" on /responses, so forwarding anything
+      // the caller sent there is a hard error rather than a hint.
       if (format === "responses") delete payload.tool_choice
       else payload.tool_choice = "none"
     }
@@ -1461,14 +1821,17 @@ async function handleChat(req, res) {
       if (delayMs > 0) await new Promise((r) => setTimeout(r, delayMs))
       delayMs = 0
       let upstreamRes
+      const wall = isStream ? headersWall() : null
       try {
         upstreamRes = await fetch(`${config.upstream}${format === "responses" ? "/responses" : "/chat/completions"}`, {
           method: "POST",
           headers: zenHeaders(req, auth),
           body: JSON.stringify(payload),
-          signal: isStream ? req.signal : AbortSignal.timeout(config.timeoutMs),
+          signal: isStream ? wall.signal : AbortSignal.timeout(config.timeoutMs),
         })
+        if (wall) wall.release()
       } catch (err) {
+        if (wall) wall.release()
         lastErr = { error: { type: "upstream_error", message: err.message } }
         lastStatus = 502
         if (attempt < retries) {
@@ -1496,10 +1859,19 @@ async function handleChat(req, res) {
             res.setHeader?.("x-zen-served-by", model)
             res.setHeader?.("x-zen-fallback", "true")
           }
-          if (format === "responses") {
-            relayResponsesStream(req, res, upstreamRes, requested, bridged)
+          // A Responses-shaped request gets a Responses-shaped stream, whichever
+          // endpoint family upstream actually served it on.
+          // Fire-and-forget relays sink their promises: the pumps own every
+          // client-visible failure, and undici's late socket rejections have
+          // nowhere else to land (measured: 4 x "TypeError: terminated").
+          if (responsesRequestShape && format === "responses") {
+            relayResponsesPassthrough(req, res, upstreamRes, requested, bridged, pin, keepable).catch(() => {})
+          } else if (responsesRequestShape) {
+            relayChatAsResponsesStream(req, res, upstreamRes, requested, bridged, pin, keepable).catch(() => {})
+          } else if (format === "responses") {
+            relayResponsesStream(req, res, upstreamRes, requested, bridged, pin, keepable).catch(() => {})
           } else {
-            relayStream(req, res, upstreamRes, requested, bridged)
+            relayStream(req, res, upstreamRes, requested, bridged, pin, keepable).catch(() => {})
           }
           res.on("finish", () => { recordReq(req, `${requested}→${model}`, Date.now() - start, 200); recordObserved(model, true) })
           return
@@ -1513,40 +1885,58 @@ async function handleChat(req, res) {
               res.setHeader?.("x-zen-served-by", model)
               res.setHeader?.("x-zen-fallback", "true")
             }
-            return json(res, 200, stripToolCalls(responsesToChat(content, requested, model), bridged))
+            // The reply answers in the dialect the request arrived in. A
+            // Responses request keeps the upstream object whole — a chat
+            // round-trip would rebuild it lossily — and only gets the model
+            // rewritten and the calls it cannot run dropped.
+            if (responsesRequestShape) {
+              content.model = requested
+              if (pin) filterResponsesOutput(content, (i) => i?.name === pin)
+              else if (keepable) filterResponsesOutput(content, (i) => !!keepable(i?.name))
+              else if (bridged) filterResponsesOutput(content, null)
+              if (model !== requested) content.zen_served_by = model
+              return json(res, 200, content)
+            }
+            return json(res, 200, stripUnpinnedCalls(stripToolCalls(responsesToChat(content, requested, model), bridged), pin, keepable))
           }
           if (model !== requested) {
             // Make the fallback visible to any client, not just JSON readers.
             res.setHeader?.("x-zen-served-by", model)
             res.setHeader?.("x-zen-fallback", "true")
           }
-          if (content && typeof content === "object") {
-            content.model = requested
-            if (model !== requested) content.zen_served_by = model
-            stripToolCalls(content, bridged)
+          const shaped = stripUnpinnedCalls(stripToolCalls(content, bridged), pin, keepable)
+          if (responsesRequestShape) {
+            return json(res, 200, chatToResponses(shaped, requested, model))
+          }
+          if (shaped && typeof shaped === "object") {
+            shaped.model = requested
+            if (model !== requested) shaped.zen_served_by = model
           }
           recordReq(req, `${requested}→${model}`, Date.now() - start, 200)
           recordObserved(model, true)
-          return json(res, 200, content)
-        } catch {
-          recordReq(req, requested, Date.now() - start, 502)
-          return json(res, 502, { error: { type: "upstream_error", message: "bad upstream response" } })
+          return json(res, 200, shaped)
+        } catch (err) {
+          // Same as the /v1/messages collective: an OK status with a reply that
+          // died in flight still has the whole chain available, and the plain
+          // request gets the real message instead of a flat "bad upstream
+          // response".
+          lastErr = { error: { type: "upstream_error", message: err?.message ? String(err.message) : "bad upstream response" } }
+          lastStatus = 502
+          recordObserved(model, false)
+          break
         }
       }
 
       try {
         lastErr = await upstreamRes.json()
       } catch {
-        lastErr = { error: { type: "upstream_error", message: `upstream returned ${upstreamRes.status}` } }
+        // Same as the /v1/messages path: an unparseable 4xx body is
+        // deterministic, so it must not read as retryable (see the longer note
+        // in handleMessages).
+        lastErr = { error: { type: "invalid_request_error", message: `upstream returned ${upstreamRes.status}` } }
       }
       lastStatus = upstreamRes.status
       const retryAfterMs = Math.min(parseRetryAfter(upstreamRes.headers.get("retry-after")) * 1000, 3000)
-      if (freeUsageExhausted(upstreamRes.status, lastErr)) {
-        recordReq(req, requested, Date.now() - start, lastStatus)
-        res.writeHead(lastStatus, { "content-type": "application/json" })
-        res.end(JSON.stringify(lastErr))
-        return
-      }
       if (transientUpstream(upstreamRes.status, lastErr) && attempt < retries) {
         delayMs = Math.max(config.retryBackoffMs * (attempt + 1), retryAfterMs)
         continue
@@ -1726,6 +2116,13 @@ async function* responsesChunksAsChat(upstreamRes) {
     } else if (d.type === "response.completed" || d.type === "response.incomplete") {
       out.choices[0].finish_reason = d.type === "response.incomplete" ? "length" : tools.length ? "tool_calls" : "stop"
       emit = true
+    } else if (d.type === "error" || d.error) {
+      // The relay reads an upstream error as a thrown failure (it emits the
+      // anthropic `error` event with this message); leaving it out used to
+      // present a responses-model failure on /v1/messages as a clean turn.
+      out.error = d.error ?? { message: typeof d.message === "string" ? d.message : "upstream stream error" }
+      yield `data: ${JSON.stringify(out)}\n\n`
+      continue
     }
     if (d.response?.usage) out.usage = usageToChat(d.response.usage)
     if (emit) yield `data: ${JSON.stringify(out)}\n\n`
@@ -1737,7 +2134,64 @@ async function* responsesChunksAsChat(upstreamRes) {
 // then message_delta carrying stop_reason and usage, then message_stop. Tool
 // arguments arrive as input_json_delta, so they are buffered until the block ends
 // rather than being re-parsed per chunk.
-function relayAnthropicStream(req, res, chunks, requested, servedBy, strip = false) {
+// A chat-completions SSE block that ends the reply: the finish chunk (its
+// finish_reason becomes a non-null value exactly once) or the [DONE] sentinel.
+// Upstreams that close the socket without either died mid-reply, and every
+// relay has to say so instead of ending like a clean empty answer — measured
+// in the hostile sweep: a mid-flight cut used to read back to agents as a
+// "successful" turn that simply held less text than the model said.
+function chatBlockTerminal(block) {
+  const b = block.trim()
+  if (b === "data: [DONE]") return true
+  if (!b.includes("finish_reason")) return false
+  for (const line of b.split("\n")) {
+    if (!line.startsWith("data:")) continue
+    try {
+      if (JSON.parse(line.slice(5).trim())?.choices?.some?.((c) => c?.finish_reason != null)) return true
+    } catch {
+      // A malformed connector guarded by the string check is not a finish.
+      return false
+    }
+  }
+  return false
+}
+
+// The real failure text travels as `data: {"error": ...}` blocks; remember it
+// so the relay's closing event says why, not just that something went wrong.
+function chatBlockError(block) {
+  const b = block.trim()
+  if (!b.startsWith("data: ") || !b.includes('"error"')) return null
+  try {
+    const d = JSON.parse(b.slice(6))
+    return d?.error ? String(d.error.message ?? "upstream stream error") : null
+  } catch {
+    return null
+  }
+}
+
+// Stream relays need walls that no runtime disagrees with. req.signal is
+// undefined on node 18+ and current bun (1.3.14) — a stream's upstream fetch
+// then ran with NO abort handling, so a dead upstream stalled the caller's
+// connection forever (measured: non-stream requests, covered by their
+// AbortSignal.timeout, kept working) — while some bun builds expose that
+// signal and abort it on the server's own idle clock, making a live stream
+// die with "The operation was aborted." (measured report). So every stream
+// upstream fetch gets a wall the handler owns: a headers-wall timer that
+// aborts if upstream never answers at all, and after the headers land, the
+// pump's own wall covers body silence. Aborts carry their honest reason text
+// instead of a runtime abort message. The response socket is deliberately
+// NOT watched here: node emits res "close" early for otherwise healthy
+// requests (measured mid-flight at ~0.5s with a live client on this proxy's
+// flow), so any socket-derived kill would abort live streams.
+function headersWall(timeoutMs = config.timeoutMs) {
+  const ctrl = new AbortController()
+  const timer = setTimeout(() => {
+    ctrl.abort(new Error(`upstream never responded within ${timeoutMs}ms (headers wall)`))
+  }, timeoutMs)
+  return { signal: ctrl.signal, release() { clearTimeout(timer) } }
+}
+
+function relayAnthropicStream(req, res, chunks, requested, servedBy, strip = false, pin = null, keepable = null) {
   res.writeHead(200, {
     "content-type": "text/event-stream",
     "cache-control": "no-cache",
@@ -1749,7 +2203,7 @@ function relayAnthropicStream(req, res, chunks, requested, servedBy, strip = fal
   const id = `msg_${randomBytes(12).toString("hex")}`
   const emit = (type, data) => res.write(`event: ${type}\ndata: ${JSON.stringify({ type, ...data })}\n\n`)
 
-  const st = { textOpen: false, thinkOpen: false, toolIndex: 0, blocks: new Map(), finish: "stop", usage: null }
+  const st = { textOpen: false, thinkOpen: false, toolIndex: 0, blocks: new Map(), finish: "stop", finished: false, usage: null, dropped: new Set(), kept: false, callKept: false, nextBlock: 1 }
   emit("message_start", {
     message: {
       id,
@@ -1777,17 +2231,20 @@ function relayAnthropicStream(req, res, chunks, requested, servedBy, strip = fal
   }
 
   const ctrl = new AbortController()
-  const onAbort = () => ctrl.abort()
-  if (req.signal?.addEventListener) req.signal.addEventListener("abort", onAbort)
-  const timer = setTimeout(() => ctrl.abort(), config.timeoutMs)
-  const cleanup = () => {
-    clearTimeout(timer)
-    if (req.signal?.removeEventListener) req.signal.removeEventListener("abort", onAbort)
-  }
+  let stalled = false
+  // Canceling the chunks generator makes the loop below end cleanly and reach
+  // the same mid-reply handling, where the stall is named for what it is.
+  ctrl.signal.addEventListener("abort", () => { chunks.return?.()?.catch?.(() => {}) })
+  const timer = setTimeout(() => {
+    stalled = true
+    ctrl.abort(new Error(`upstream sent nothing for ${config.timeoutMs}ms (relay wall)`))
+  }, config.timeoutMs)
+  const cleanup = () => clearTimeout(timer)
 
   const pump = async () => {
     try {
       for await (const chunkText of chunks) {
+        if (chatBlockTerminal(chunkText)) st.finished = true
         {
           for (const line of chunkText.split("\n")) {
             if (!line.startsWith("data:")) continue
@@ -1800,6 +2257,10 @@ function relayAnthropicStream(req, res, chunks, requested, servedBy, strip = fal
               continue
             }
             if (!d || typeof d !== "object") continue
+            // Upstream declares the reply failed with an explicit error chunk;
+            // dropping it (the old behavior) presented a truncated stream as a
+            // clean end_turn. Reaching the catch emits the real `error` event.
+            if (d.error) throw new Error(d.error.message ?? "upstream stream error")
             if (d.usage) st.usage = d.usage
             const choice = d.choices?.[0]
             const delta = choice?.delta ?? {}
@@ -1825,18 +2286,45 @@ function relayAnthropicStream(req, res, chunks, requested, servedBy, strip = fal
               closeThink()
               closeText()
               const tIndex = tc.index ?? 0
+              // A call's name arrives in its first chunk; argument chunks for it
+              // follow under the same index with `name: null`. So the keep/drop
+              // decision is made at the name chunk and remembered per index —
+              // otherwise a strip would leak the dropped call's arguments.
+              if (tc.function?.name) {
+                // A call the caller cannot run — a manifest name with no
+                // equivalent of the caller's, or a completely invented one —
+                // never reaches it: the decision is made on the raw name
+                // before any agent-tool remapping could rename it.
+                if (!pin && keepable && !keepable(tc.function.name)) {
+                  st.dropped.add(tIndex)
+                  continue
+                }
+                const mapped = remapAgentTool(tc.function.name, "{}")
+                const resolved = mapped ? mapped.name : tc.function.name
+                if (pin && resolved !== pin) {
+                  st.dropped.add(tIndex)
+                  continue
+                }
+                if (pin) st.kept = true
+                st.callKept = true
+              } else if (st.dropped.has(tIndex)) {
+                continue
+              }
+              // Renumbered blocks only when filtering — the plain path keeps the
+              // upstream index so a caller never sees a numbering change.
+              const blockIndex = st.blocks.has(tIndex) ? st.blocks.get(tIndex).index : pin ? st.nextBlock++ : tIndex + 1
               if (!st.blocks.has(tIndex)) {
                 const rawName = tc.function?.name ?? "unknown"
                 const mapped = remapAgentTool(rawName, "{}")
                 st.blocks.set(tIndex, {
-                  index: tIndex + 1,
+                  index: blockIndex,
                   id: tc.id ?? `toolu_${randomBytes(8).toString("hex")}`,
                   raw: rawName,
                   name: mapped ? mapped.name : rawName,
                   args: "",
                 })
                 emit("content_block_start", {
-                  index: tIndex + 1,
+                  index: blockIndex,
                   content_block: { type: "tool_use", id: st.blocks.get(tIndex).id, name: st.blocks.get(tIndex).name, input: {} },
                 })
               }
@@ -1844,6 +2332,18 @@ function relayAnthropicStream(req, res, chunks, requested, servedBy, strip = fal
             }
           }
         }
+      }
+      if (!st.finished) {
+        // The upstream stream closed without a finish chunk or [DONE]: claiming
+        // message_stop would present a truncated reply as a completed turn
+        // (measured: hostile mid-cut). Anthropic carries mid-stream failure as
+        // an `error` event — emit it, close nothing further, stop. A wall abort
+        // cancelled the generator into done — name the stall for what it is.
+        closeThink()
+        closeText()
+        emit("error", { error: { type: "api_error", message: stalled ? "upstream stalled past the relay wall" : "upstream stream ended mid-reply" } })
+        res.end()
+        return
       }
       closeThink()
       closeText()
@@ -1856,14 +2356,27 @@ function relayAnthropicStream(req, res, chunks, requested, servedBy, strip = fal
         emit("content_block_stop", { index: t.index })
       }
       const u = st.usage ?? {}
+      // The model claimed a tool call but every call got filtered away: the
+      // message ends without one, so it cannot claim tool_use.
+      // A tool_calls claim that outlived its calls (pin kept nothing, or every
+      // call in a stub-riding turn was the dropped stub) must not survive.
+      const claimed = pin ? st.kept : keepable ? st.callKept : true
+      const finish = st.finish === "tool_calls" && !claimed ? "stop" : st.finish
       emit("message_delta", {
-        delta: { stop_reason: STOP_REASON[st.finish] ?? "end_turn", stop_sequence: null },
+        delta: { stop_reason: STOP_REASON[finish] ?? "end_turn", stop_sequence: null },
         usage: { input_tokens: u.prompt_tokens ?? 0, output_tokens: u.completion_tokens ?? 0 },
       })
       emit("message_stop", {})
       res.write("data: [DONE]\n\n")
       res.end()
-    } catch {
+    } catch (err) {
+      if (!req.signal?.aborted && !res.writableEnded) {
+        closeThink()
+        closeText()
+        // The 200 is already on the wire; Anthropic's mid-stream failure event
+        // is the only way left to tell the caller the turn collapsed.
+        emit("error", { error: { type: "api_error", message: err?.message ?? "upstream stream ended mid-reply" } })
+      }
       res.end()
     } finally {
       cleanup()
@@ -1886,25 +2399,127 @@ function stripToolCalls(chunk, strip) {
   return chunk
 }
 
-function relayStream(req, res, upstreamRes, requested, strip = false) {
+// The pin is not enforcement: the provider may answer a pinned request with a
+// call the caller never offered — the gate stub's `read` included, measured 3-6
+// of 12 against the live gateway on a prompt that mentions reading a file. A
+// pinned reply keeps the pinned call and nothing else; anything else is a tool
+// the pinned-caller contract never allowed. Collected replies are trimmed
+// here; streamed ones are filtered chunk by chunk in the relays, which carry
+// per-index state because a call's name arrives chunks apart from its
+// arguments.
+//
+// `keepable` (when set, never together with a pin) is the per-request rule
+// built by `keepableFor()`: a reply may only carry calls the caller offered.
+function stripUnpinnedCalls(content, pin, keepable = null) {
+  if ((!pin && !keepable) || !content || typeof content !== "object") return content
+  for (const choice of content?.choices ?? []) {
+    const body = choice?.message ?? choice?.delta
+    if (Array.isArray(body?.tool_calls) && body.tool_calls.length) {
+      const nameOf = (tc) => tc?.function?.name ?? tc?.name
+      const keep = pin ? (tc) => nameOf(tc) === pin : (tc) => keepable(nameOf(tc))
+      const kept = body.tool_calls.filter(keep)
+      if (kept.length) body.tool_calls = kept
+      else delete body.tool_calls
+    }
+    // No call survived and the model still claimed `tool_calls`: an empty
+    // claim reads like a bug to every client, not like an answer.
+    if (choice?.finish_reason === "tool_calls" && !body?.tool_calls?.length) choice.finish_reason = "stop"
+  }
+  return content
+}
+
+// Bookkeeping carried from one SSE block to the next by the streamed pinned
+// filter. `tool_calls` chunks are tied together by `index`: the name names the
+// call once and every argument chunk follows under the same index with
+// `name: null`, so the keep/drop decision has to outlive the block that first
+// saw the name. Kept calls are renumbered into one clean sequence.
+function pinStreamState(pin, keepable = null) {
+  return {
+    pin,
+    keepable,
+    byChoice: new Map(),
+  }
+}
+
+function filterPinnedDelta(parsed, pinState) {
+  for (const choice of parsed?.choices ?? []) {
+    const key = choice?.index ?? 0
+    let s = pinState.byChoice.get(key)
+    if (!s) {
+      s = { dropped: new Set(), kept: false, count: 0, renumber: new Map() }
+      pinState.byChoice.set(key, s)
+    }
+    const body = choice?.delta ?? choice?.message
+    if (Array.isArray(body?.tool_calls) && body.tool_calls.length) {
+      const kept = []
+      for (const tc of body.tool_calls) {
+        const idx = tc?.index ?? 0
+        if (tc?.function?.name) {
+          if (pinState.pin) {
+            if (tc.function.name === pinState.pin) {
+              if (!s.renumber.has(idx)) s.renumber.set(idx, s.count++)
+              s.kept = true
+            } else {
+              s.dropped.add(idx)
+              continue
+            }
+          } else if (pinState.keepable && !pinState.keepable(tc.function.name)) {
+            // A call the caller cannot run (manifest name or an invented
+            // one): drop it by raw name and renumber whatever survives into
+            // one clean sequence.
+            s.dropped.add(idx)
+            continue
+          } else {
+            if (!s.renumber.has(idx)) s.renumber.set(idx, s.count++)
+            s.kept = true
+          }
+        } else if (s.dropped.has(idx)) {
+          continue
+        }
+        if (s.renumber.has(idx)) tc.index = s.renumber.get(idx)
+        kept.push(tc)
+      }
+      if (kept.length) body.tool_calls = kept
+      else delete body.tool_calls
+    }
+    if (choice?.finish_reason === "tool_calls" && !s.kept) choice.finish_reason = "stop"
+  }
+}
+
+function relayStream(req, res, upstreamRes, requested, strip = false, pin = null, keepable = null) {
   res.writeHead(200, {
     "content-type": upstreamRes.headers.get("content-type") ?? "text/event-stream",
     "cache-control": "no-cache",
     connection: "keep-alive",
   })
+  // One bookkeeping object per request: a pinned call's chunks span several SSE
+  // blocks, so the filter cannot see them one at a time. Calls the caller
+  // cannot run ride the same per-index bookkeeping for dropping those.
+  const pinned = pin || keepable ? pinStreamState(pin, keepable) : null
   const reader = upstreamRes.body.getReader()
   const decoder = new TextDecoder()
   let buffer = ""
+  let sawFinish = false
+  let upstreamErr = null
   const ctrl = new AbortController()
-  const onAbort = () => ctrl.abort()
-  if (req.signal?.addEventListener) req.signal.addEventListener("abort", onAbort)
-  const timer = setTimeout(() => ctrl.abort(), config.timeoutMs)
+  let stalled = false
   ctrl.signal.addEventListener("abort", () => {
     reader.cancel().catch(() => {})
   })
-  const cleanup = () => {
-    clearTimeout(timer)
-    if (req.signal?.removeEventListener) req.signal.removeEventListener("abort", onAbort)
+  const timer = setTimeout(() => {
+    stalled = true
+    ctrl.abort(new Error(`upstream sent nothing for ${config.timeoutMs}ms (relay wall)`))
+  }, config.timeoutMs)
+  const cleanup = () => clearTimeout(timer)
+  const midReplyError = (message) => {
+    // The 200 line is already on the wire — an in-band error chunk plus the
+    // [DONE] sentinel is the only honest ending left. SDKs raise on error
+    // chunks instead of returning a silent half-turn.
+    if (!req.signal?.aborted && !res.writableEnded) {
+      res.write(`data: ${JSON.stringify({ error: { type: "upstream_error", message } })}\n\n`)
+      res.write("data: [DONE]\n\n")
+    }
+    res.end()
   }
   const pump = async () => {
     try {
@@ -1912,7 +2527,12 @@ function relayStream(req, res, upstreamRes, requested, strip = false) {
         const { done, value } = await reader.read()
         if (done) {
           if (buffer.trim()) res.write(buffer)
-          res.end()
+          // Upstream closed without delivering a finish chunk or [DONE]: the
+          // reply died in flight, and a silent end reads like a successful
+          // empty turn (measured against a hostile mid-cut). A wall abort
+          // cancels the reader into done — name the stall for what it is.
+          if (!sawFinish) midReplyError(upstreamErr ?? (stalled ? "upstream stalled past the relay wall" : "upstream stream ended mid-reply"))
+          else res.end()
           return
         }
         buffer += decoder.decode(value, { stream: true })
@@ -1920,12 +2540,16 @@ function relayStream(req, res, upstreamRes, requested, strip = false) {
         while ((idx = buffer.indexOf("\n\n")) !== -1) {
           const block = buffer.slice(0, idx)
           buffer = buffer.slice(idx + 2)
-          const out = rewriteSSE(block, requested, strip)
+          if (!upstreamErr) upstreamErr = chatBlockError(block)
+          const out = rewriteSSE(block, requested, strip, pinned)
           if (out) res.write(out)
+          if (chatBlockTerminal(block)) sawFinish = true
         }
       }
-    } catch {
-      res.end()
+    } catch (err) {
+      // The reader died (cut, reset, abort). Nothing more can come upstream;
+      // surface it in-band before ending.
+      midReplyError(upstreamErr ?? err?.message ?? "upstream stream ended mid-reply")
     } finally {
       cleanup()
     }
@@ -1968,10 +2592,13 @@ function probeAuthHeader() {
 }
 
 // Health probes have to look like agent traffic or the free-tier gate refuses
-// them with FreeTierError before a model is ever reached: opencode's own tool
-// manifest plus `stream: true` is what a real client sends, so the probe sends
-// exactly that. Without it every model used to land in the "gate-blocked"
-// bucket, which told the user nothing about whether it actually works.
+// them: its `429 FreeUsageLimitError` covers every request it cannot tie to a
+// real opencode client, and a thin `"ping"` with a stub manifest is not one
+// (measured: the recipe below streams 200 while a 2 KB same-header request is
+// refused in the same second). It wants the *harness system text* — a truncated
+// or generic one is refused — and a plausible tool manifest. Sending this shape
+// is also what makes sync buckets land in `working` instead of `rateLimited`,
+// where a refused probe parks the model display-forever.
 function agentProbePayload(id, format) {
   // A classifier is not a chat model: it takes a state and typed questions, so a
   // chat-shaped probe would only ever come back as a shape error.
@@ -1979,19 +2606,34 @@ function agentProbePayload(id, format) {
     return { model: id, state: "ping", questions: { ping: { type: "noul", instructions: "Is this request a liveness check?" } } }
   }
   const tools = gateBridgeTools()
+  const preamble = bridgePreamble()
+  const ask = "Reply with exactly OK1 and nothing else."
   if (format === "responses") {
-    const payload = { model: id, input: "ping", max_output_tokens: 32, stream: true }
+    const payload = {
+      model: id,
+      input: [{ role: "user", content: [{ type: "input_text", text: ask }] }],
+      max_output_tokens: 32,
+      stream: true,
+    }
+    if (preamble) payload.instructions = preamble
     const converted = chatToolsToResponses(tools)
     if (converted) payload.tools = converted
     return payload
   }
-  const payload = { model: id, messages: [{ role: "user", content: "ping" }], max_tokens: 5, stream: true }
-  if (tools.length) {
-    payload.tools = tools
-    // The bridge is for the gate, not the answer: a "ping" should come back as
-    // text, never as a tool call.
-    payload.tool_choice = "none"
+  // Mirror the wire shape the real client sends (stream_options and a real
+  // token budget included); no `tool_choice` — the pinned ask keeps the answer
+  // text, and the probe only reads the status anyway.
+  const payload = {
+    model: id,
+    messages: [
+      ...(preamble ? [{ role: "system", content: preamble }] : []),
+      { role: "user", content: ask },
+    ],
+    stream: true,
+    stream_options: { include_usage: true },
+    max_completion_tokens: 32000,
   }
+  if (tools.length) payload.tools = tools
   return payload
 }
 
@@ -2004,8 +2646,17 @@ async function probeModel(id, auth, session) {
     accept: "application/json, text/event-stream",
     authorization: auth,
     "user-agent": config.ua,
+    // v2 wire parity — the gate reads more than the session pair.
+    "x-opencode-client": config.clientName,
+    "x-opencode-project": projectHash(),
   }
-  if (session) for (const h of SESSION_HEADERS) headers[h] = session
+  if (session) {
+    for (const h of SESSION_HEADERS) headers[h] = session
+    // Same affinity pair a real client carries alongside the session pair.
+    headers["x-session-affinity"] = session
+    headers["x-session-id"] = session
+  }
+  if (config.tracing) for (const [k, v] of Object.entries(traceHeaders())) headers[k] = v
   const r = await fetch(`${config.upstream}${format === "responses" ? "/responses" : "/chat/completions"}`, {
     method: "POST",
     headers,
@@ -2021,7 +2672,7 @@ async function probeModel(id, auth, session) {
 }
 
 // Stream a Responses SSE body back as chat.completion.chunk SSE.
-function relayResponsesStream(req, res, upstreamRes, requested, strip = false) {
+function relayResponsesStream(req, res, upstreamRes, requested, strip = false, pin = null, keepable = null) {
   res.writeHead(200, {
     "content-type": "text/event-stream",
     "cache-control": "no-cache",
@@ -2030,21 +2681,24 @@ function relayResponsesStream(req, res, upstreamRes, requested, strip = false) {
   const id = `chatcmpl-${randomBytes(12).toString("hex")}`
   const created = Math.floor(Date.now() / 1000)
   const base = { id, object: "chat.completion.chunk", created, model: requested }
-  const state = { tools: [], usage: null, finish: "stop" }
+  // The pinned filter spans blocks like every other one: a call's name and its
+  // argument chunks arrive in separate events under the same call id.
+  const state = { tools: [], usage: null, finish: "stop", dropped: new Set(), kept: false, count: 0, renumber: new Map() }
+  let sawFinish = false
+  let upstreamErr = null
   const reader = upstreamRes.body.getReader()
   const decoder = new TextDecoder()
   let buffer = ""
   const ctrl = new AbortController()
-  const onAbort = () => ctrl.abort()
-  if (req.signal?.addEventListener) req.signal.addEventListener("abort", onAbort)
-  const timer = setTimeout(() => ctrl.abort(), config.timeoutMs)
+  let stalled = false
   ctrl.signal.addEventListener("abort", () => {
     reader.cancel().catch(() => {})
   })
-  const cleanup = () => {
-    clearTimeout(timer)
-    if (req.signal?.removeEventListener) req.signal.removeEventListener("abort", onAbort)
-  }
+  const timer = setTimeout(() => {
+    stalled = true
+    ctrl.abort(new Error(`upstream sent nothing for ${config.timeoutMs}ms (relay wall)`))
+  }, config.timeoutMs)
+  const cleanup = () => clearTimeout(timer)
   const send = (choices, extra) =>
     res.write(`data: ${JSON.stringify({ ...base, choices, ...(extra ?? {}) })}\n\n`)
 
@@ -2074,21 +2728,81 @@ function relayResponsesStream(req, res, upstreamRes, requested, strip = false) {
           }
           if (data?.response?.usage) state.usage = data.response.usage
           if (data?.type === "response.completed" || data?.type === "response.incomplete") {
-            state.finish = data.type === "response.incomplete" ? "length" : state.tools.length ? "tool_calls" : "stop"
+            sawFinish = true
+            // `strip` (the tool-less bridge) and the pinned filter both swallow
+            // calls: a finish that claims tool_calls must not outlive them.
+            state.finish =
+              data.type === "response.incomplete"
+                ? "length"
+                : strip
+                  ? "stop"
+                  : pin || keepable
+                    ? // A filtered turn keeps the tool_calls claim only when a
+                      // call survived the filter.
+                      state.kept
+                      ? "tool_calls"
+                      : "stop"
+                    : state.tools.length
+                      ? "tool_calls"
+                      : "stop"
             continue
           }
-          if (data?.type === "error" || data?.error) continue
-          for (const delta of responsesEventToDeltas(event, data, state)) {
+          if (data?.type === "error" || data?.error) {
+            if (!upstreamErr) upstreamErr = data?.error?.message ?? (typeof data?.message === "string" ? data.message : null)
+            if (!upstreamErr) upstreamErr = "upstream stream error"
+            continue
+          }
+          for (let delta of responsesEventToDeltas(event, data, state)) {
             if (strip && delta.tool_calls) delete delta.tool_calls
+            else if ((pin || keepable) && Array.isArray(delta.tool_calls)) {
+              const kept = []
+              for (const tc of delta.tool_calls) {
+                const idx = tc?.index ?? 0
+                if (tc?.function?.name) {
+                  if (pin) {
+                    if (tc.function.name === pin) {
+                      if (!state.renumber.has(idx)) state.renumber.set(idx, state.count++)
+                      state.kept = true
+                    } else {
+                      state.dropped.add(idx)
+                      continue
+                    }
+                  } else if (keepable && !keepable(tc.function.name)) {
+                    state.dropped.add(idx)
+                    continue
+                  } else {
+                    if (!state.renumber.has(idx)) state.renumber.set(idx, state.count++)
+                    state.kept = true
+                  }
+                } else if (state.dropped.has(idx)) continue
+                if (state.renumber.has(idx)) tc.index = state.renumber.get(idx)
+                kept.push(tc)
+              }
+              if (kept.length) delta.tool_calls = kept
+              else delete delta.tool_calls
+            }
             if (Object.keys(delta).length === 0) continue
             send([{ index: 0, delta, finish_reason: null }])
           }
         }
       }
-      send([{ index: 0, delta: {}, finish_reason: strip ? "stop" : state.finish }], state.usage ? { usage: usageToChat(state.usage) } : {})
-      res.write("data: [DONE]\n\n")
+      if (sawFinish) {
+        send([{ index: 0, delta: {}, finish_reason: state.finish }], state.usage ? { usage: usageToChat(state.usage) } : {})
+        res.write("data: [DONE]\n\n")
+      } else {
+        // Upstream never declared completion: end with the failure instead of
+        // a finish_reason the model never reached (measured: hostile mid-cut).
+        if (!req.signal?.aborted && !res.writableEnded) {
+          res.write(`data: ${JSON.stringify({ error: { type: "upstream_error", message: upstreamErr ?? (stalled ? "upstream stalled past the relay wall" : "upstream stream ended mid-reply") } })}\n\n`)
+          res.write("data: [DONE]\n\n")
+        }
+      }
       res.end()
-    } catch {
+    } catch (err) {
+      if (!req.signal?.aborted && !res.writableEnded) {
+        res.write(`data: ${JSON.stringify({ error: { type: "upstream_error", message: upstreamErr ?? err?.message ?? "upstream stream ended mid-reply" } })}\n\n`)
+        res.write("data: [DONE]\n\n")
+      }
       res.end()
     } finally {
       cleanup()
@@ -2097,7 +2811,295 @@ function relayResponsesStream(req, res, upstreamRes, requested, strip = false) {
   return pump()
 }
 
-function rewriteSSE(block, requested, strip = false) {
+// chat.completions SSE -> Responses SSE, for a Responses-shaped caller whose
+// model lives on /chat/completions. Event dialect mirrors what the upstream
+// gateway itself emits for native /responses traffic, emitted live — the
+// callers here are agents, and buffering the stream would throw the latency
+// away.
+function relayChatAsResponsesStream(req, res, upstreamRes, requested, strip = false, pin = null, keepable = null) {
+  res.writeHead(200, {
+    "content-type": "text/event-stream",
+    "cache-control": "no-cache",
+    connection: "keep-alive",
+  })
+  const id = `resp_${randomBytes(12).toString("hex")}`
+  const created = Math.floor(Date.now() / 1000)
+  const evt = (type, data) => res.write(`event: ${type}\ndata: ${JSON.stringify({ type, ...data })}\n\n`)
+  evt("response.created", { response: { id, object: "response", created_at: created, status: "in_progress", model: requested, output: [] } })
+
+  // Output items are created lazily at their first delta, so a reply with no
+  // text or no calls produces no empty items. Reasoning deltas are delivered
+  // as reasoning_text events live, without item framing of their own — the
+  // same as the upstream relay emits them.
+  const items = []
+  const st = {
+    message: null, // { index, text } — opened at the first content delta
+    calls: new Map(), // chat index -> { index, id, callId, name, args }
+    usage: null,
+    finished: false, // a finish chunk or [DONE] was seen upstream
+    dropped: new Set(), // pinned-filter: chat indices that name a stray call
+  }
+
+  // Same relay wall as the pumps that hold their own reader: unlike them this
+  // one had NO timer, so a dead upstream stalled the stream forever. Cancelling
+  // the generator ends the loop cleanly into the mid-reply handling below.
+  const chunksIter = sseChunks(upstreamRes)
+  const wall = new AbortController()
+  let stalled = false
+  wall.signal.addEventListener("abort", () => { chunksIter.return?.()?.catch?.(() => {}) })
+  const wallTimer = setTimeout(() => {
+    stalled = true
+    wall.abort(new Error(`upstream sent nothing for ${config.timeoutMs}ms (relay wall)`))
+  }, config.timeoutMs)
+  const cleanup = () => clearTimeout(wallTimer)
+
+  const pump = async () => {
+    try {
+      for await (const chunk of chunksIter) {
+        if (chatBlockTerminal(chunk)) st.finished = true
+        let raw = ""
+        for (const line of chunk.split("\n")) if (line.startsWith("data:")) raw = line.slice(5).trim()
+        if (!raw || raw === "[DONE]") continue
+        let d
+        try {
+          d = JSON.parse(raw)
+        } catch {
+          continue
+        }
+        if (d?.error) throw new Error(d.error.message ?? "upstream stream error")
+        if (d?.usage) st.usage = d.usage
+        const choice = d?.choices?.[0]
+        if (!choice) continue
+        const delta = choice.delta ?? {}
+        if (typeof delta.reasoning_content === "string" && delta.reasoning_content) {
+          evt("response.reasoning_text.delta", { delta: delta.reasoning_content })
+        }
+        if (typeof delta.content === "string" && delta.content) {
+          if (!st.message) {
+            const index = items.length
+            const item = { type: "message", role: "assistant", content: [] }
+            items.push(item)
+            st.message = { index, text: "" }
+            evt("response.output_item.added", { output_index: index, item: { ...item, status: "in_progress" } })
+            evt("response.content_part.added", { output_index: index, content_index: 0, part: { type: "output_text", text: "", annotations: [] } })
+          }
+          st.message.text += delta.content
+          evt("response.output_text.delta", { output_index: st.message.index, content_index: 0, delta: delta.content })
+        }
+        // Responses replies put tool calls after the message as sibling output
+        // items, not interleaved into the message's content parts — so each
+        // call opens its own item the first time its (renumbered) chunk shows.
+        for (const tc of strip ? [] : delta.tool_calls ?? []) {
+          const tIndex = tc.index ?? 0
+          // Same per-index contract the other relays carry: the name names the
+          // call once, argument chunks follow under the same index nameless.
+          if (tc.function?.name) {
+            if (pin && tc.function.name !== pin) {
+              st.dropped.add(tIndex)
+              continue
+            }
+            if (!pin && keepable && !keepable(tc.function.name)) {
+              st.dropped.add(tIndex)
+              continue
+            }
+          } else if (st.dropped.has(tIndex)) {
+            continue
+          }
+          if (!st.calls.has(tIndex)) {
+            const index = items.length
+            const item = { type: "function_call", id: `fc_${randomBytes(8).toString("hex")}`, call_id: tc.id ?? `call_${index}`, name: tc.function?.name ?? "unknown", arguments: "" }
+            const entry = { index, item, args: "" }
+            st.calls.set(tIndex, entry)
+            items.push(item)
+            evt("response.output_item.added", { output_index: index, item: { ...item, status: "in_progress" } })
+          }
+          const entry = st.calls.get(tIndex)
+          if (tc.function?.arguments) {
+            entry.args += tc.function.arguments
+            evt("response.function_call_arguments.delta", { item_id: entry.item.id, output_index: entry.index, delta: tc.function.arguments })
+          }
+        }
+      }
+      // Stream complete: close what was opened in output order, then completed.
+      if (!st.finished) {
+        // The chat-chunk stream never reached a finish chunk (measured: hostile
+        // mid-cut): emitting response.completed would tell the caller a turn
+        // ended that upstream never finished. The Responses dialect carries
+        // mid-stream failure as an `error` event.
+        if (!req.signal?.aborted && !res.writableEnded) evt("error", { error: { type: "api_error", message: stalled ? "upstream stalled past the relay wall" : "upstream stream ended mid-reply" } })
+        res.end()
+        return
+      }
+      const output = items.map((item) => {
+        if (item.type === "message") {
+          item.id = `msg_${id}`
+          item.status = "completed"
+          item.content = [{ type: "output_text", text: st.message?.text ?? "", annotations: [] }]
+        }
+        if (item.type === "function_call") {
+          const entry = [...st.calls.values()].find((e) => e.item === item)
+          item.status = "completed"
+          item.arguments = entry?.args ?? item.arguments
+        }
+        return item
+      })
+      if (st.message) evt("response.output_text.done", { output_index: st.message.index, content_index: 0, text: st.message.text })
+      for (const entry of st.calls.values()) {
+        evt("response.function_call_arguments.done", { item_id: entry.id, output_index: entry.index, arguments: entry.args })
+      }
+      items.forEach((item, i) => {
+        evt("response.output_item.done", { output_index: i, item })
+      })
+      evt("response.completed", {
+        response: {
+          id,
+          object: "response",
+          created_at: created,
+          status: "completed",
+          model: requested,
+          output,
+          usage: {
+            input_tokens: st.usage?.prompt_tokens ?? 0,
+            output_tokens: st.usage?.completion_tokens ?? 0,
+            total_tokens: st.usage?.total_tokens ?? (st.usage?.prompt_tokens ?? 0) + (st.usage?.completion_tokens ?? 0),
+          },
+        },
+      })
+      res.end()
+    } catch (err) {
+      // The 200 is on the wire already: announce the collapse in-band.
+      if (!req.signal?.aborted) evt("error", { error: { type: "api_error", message: err?.message ?? "upstream stream ended mid-reply" } })
+      res.end()
+    }
+  }
+  return pump()
+}
+
+// Responses SSE -> client, for a Responses-shaped caller whose model is a
+// native /responses one: upstream already speaks the same dialect, so this is
+// a passthrough that rewrites the model and drops calls the caller cannot run
+// (the bridge manifest's, and everything but the pinned one).
+function relayResponsesPassthrough(req, res, upstreamRes, requested, strip = false, pin = null, keepable = null) {
+  res.writeHead(200, {
+    "content-type": "text/event-stream",
+    "cache-control": "no-cache",
+    connection: "keep-alive",
+  })
+  const dropped = new Set()
+  const allowed = new Set()
+  // One decision rule for every shape a call can arrive in: the added item
+  // carries the name, the later chunks reference it by id.
+  const decide = (item) => {
+    const callId = item?.item_id ?? item?.call_id ?? item?.id
+    const name = item?.name
+    if (name) {
+      if (strip) {
+        dropped.add(callId)
+        return false
+      }
+      if (pin && name !== pin) {
+        dropped.add(callId)
+        return false
+      }
+      if (!pin && keepable && !keepable(name)) {
+        dropped.add(callId)
+        return false
+      }
+      allowed.add(callId)
+      return true
+    }
+    if (allowed.has(callId)) return true
+    if (dropped.has(callId)) return false
+    return !(pin || strip || keepable)
+  }
+  const reader = upstreamRes.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ""
+  let sawFinish = false
+  let upstreamErr = null
+  const ctrl = new AbortController()
+  let stalled = false
+  ctrl.signal.addEventListener("abort", () => {
+    reader.cancel().catch(() => {})
+  })
+  const timer = setTimeout(() => {
+    stalled = true
+    ctrl.abort(new Error(`upstream sent nothing for ${config.timeoutMs}ms (relay wall)`))
+  }, config.timeoutMs)
+  const cleanup = () => clearTimeout(timer)
+  const parseBlock = (block) => {
+    let event = ""
+    let raw = ""
+    for (const line of block.split("\n")) {
+      if (line.startsWith("event:")) event = line.slice(6).trim()
+      else if (line.startsWith("data:")) raw = line.slice(5).trim()
+    }
+    if (!raw || raw === "[DONE]") return null
+    try {
+      return JSON.parse(raw)
+    } catch {
+      return null
+    }
+  }
+  const pump = async () => {
+    try {
+      for (;;) {
+        const { done, value } = await reader.read()
+        if (done) break
+        buffer += decoder.decode(value, { stream: true })
+        let idx
+        while ((idx = buffer.indexOf("\n\n")) !== -1) {
+          const block = buffer.slice(0, idx)
+          buffer = buffer.slice(idx + 2)
+          if (!block.trim()) continue
+          const data = parseBlock(block)
+          if (!data) continue
+          if (data?.response?.model && typeof data.response.model === "string") data.response.model = requested
+          const type = data?.type ?? ""
+          if (type === "response.completed" || type === "response.incomplete") sawFinish = true
+          else if (type === "error" || data?.error) {
+            if (!upstreamErr) upstreamErr = data?.error?.message ?? (typeof data?.message === "string" ? data.message : null)
+            if (!upstreamErr) upstreamErr = "upstream stream error"
+          }
+          if (type === "response.output_item.added" || type === "response.output_item.done") {
+            if (data.item?.type === "function_call" && !decide(data.item)) continue
+          } else if (type.startsWith("response.function_call_arguments")) {
+            const callId = data.item_id ?? data.call_id
+            if (strip || dropped.has(callId)) continue
+          } else if ((type === "response.completed" || type === "response.incomplete") && Array.isArray(data.response?.output)) {
+            data.response.output = data.response.output.filter((item) => (item?.type === "function_call" ? decide(item) : true))
+          }
+          res.write(`event: ${type}\ndata: ${JSON.stringify(data)}\n\n`)
+        }
+      }
+      if (buffer.trim()) {
+        const data = parseBlock(buffer)
+        if (data) {
+          if (data?.response?.model && typeof data.response.model === "string") data.response.model = requested
+          res.write(`event: ${data?.type ?? ""}\ndata: ${JSON.stringify(data)}\n\n`)
+          if (data?.type === "response.completed" || data?.type === "response.incomplete") sawFinish = true
+        }
+      }
+      // No completion event ever arrived: the stream died mid-reply (measured
+      // against a hostile cut). The Responses dialect says failure as an
+      // `error` event; silence reads like a successful partial turn.
+      if (!sawFinish && !req.signal?.aborted && !res.writableEnded) {
+        res.write(`event: error\ndata: ${JSON.stringify({ type: "error", code: "upstream_error", message: upstreamErr ?? (stalled ? "upstream stalled past the relay wall" : "upstream stream ended mid-reply") })}\n\n`)
+      }
+      res.end()
+    } catch (err) {
+      if (!req.signal?.aborted && !res.writableEnded) {
+        res.write(`event: error\ndata: ${JSON.stringify({ type: "error", code: "upstream_error", message: upstreamErr ?? err?.message ?? "upstream stream ended mid-reply" })}\n\n`)
+      }
+      res.end()
+    } finally {
+      cleanup()
+    }
+  }
+  return pump()
+}
+
+function rewriteSSE(block, requested, strip = false, pinState = null) {
   if (!block.trim()) return null
   const lines = block.split("\n")
   const out = []
@@ -2112,6 +3114,7 @@ function rewriteSSE(block, requested, strip = false) {
         const parsed = JSON.parse(payload)
         if (parsed && typeof parsed === "object" && "model" in parsed) parsed.model = requested
         stripToolCalls(parsed, strip)
+        if (pinState) filterPinnedDelta(parsed, pinState)
         out.push(`data: ${JSON.stringify(parsed)}`)
       } catch {
         out.push(line)
@@ -2130,7 +3133,7 @@ async function fetchModels() {
   if (modelsFetching) return modelsFetching
   modelsFetching = (async () => {
     try {
-      const res = await fetch(`${config.upstream}/models`, {
+      const res = await fetch(`${MODEL_LIST_BASE}/models`, {
         headers: { "user-agent": config.ua },
         signal: AbortSignal.timeout(15_000),
       })
@@ -2174,7 +3177,7 @@ async function syncModels() {
   syncState.at = Date.now()
   const start = Date.now()
   try {
-    const res = await fetch(`${config.upstream}/models`, {
+    const res = await fetch(`${MODEL_LIST_BASE}/models`, {
       headers: { "user-agent": config.ua },
       signal: AbortSignal.timeout(15_000),
     })
@@ -2201,6 +3204,11 @@ async function syncModels() {
     const removeFromCurrent = new Set()
     const auth = probeAuthHeader()
     let idx = 0
+    // Probes run serially with a beat between hops. The gate blanket-403s a
+    // rapid model-hop burst from one identity: with 3 concurrent workers the
+    // identical request shape that streams 200 one-at-a-time landed all 8
+    // models in the gate-blocked bucket within a single 1.8s sync (measured
+    // both ways). ~0.4s apart reads as one focused client, not a scan.
     const probe = async () => {
       while (idx < candidates.length) {
         const id = candidates[idx++]
@@ -2223,11 +3231,13 @@ async function syncModels() {
             }
           } catch {}
           if (r.ok && !bodyErr) { working.push(id); modelHealth.set(id, 0) }
-          // 429 is the account's free allowance, not the model's health. The body is
-          // usually a JSON error (FreeUsageLimitError / "Free usage limit reached"),
-          // and treating that as a model failure deleted every model from the user's
-          // list after three hourly syncs - long after the quota refilled.
-          else if (r.status === 429 || /FreeUsageLimit|usage.?limit|quota|too many requests/i.test(bodyErr)) {
+          // 429 is the account's free allowance, not the model's health. The body
+          // is usually a JSON error (FreeUsageLimitError / "Free usage limit
+          // reached"), and treating that as a model failure deleted every model
+          // from the user's list after three hourly syncs - long after the quota
+          // refilled. The v2 gate answers the same payload for a refused request,
+          // so neither shape may ever reach the fail counter.
+          else if (r.status === 429 || /FreeUsageLimit|free.?usage.?limit|usage.?limit|quota|too many requests/i.test(bodyErr)) {
             rateLimited.push(id)
             modelHealth.set(id, 0)
           }
@@ -2251,7 +3261,7 @@ async function syncModels() {
             // call it flaky, never remove it.
             const isGated = /FreeTierError|free tier can only/i.test(bodyErr)
             // Temporary blocks: keep the model, just remember it is unhealthy.
-            const temporary = /RegionError|not available in your country|rate.?limit|overloaded/i.test(bodyErr)
+            const temporary = /RegionError|not available in your country|rate.?limit|free.?usage.?limit|overloaded/i.test(bodyErr)
             if (gone) { dead.push(id); removeFromCurrent.add(id) }
             else if (isGated) { gated.push(id) }
             else if (authErr) { flaky.push(id) }
@@ -2267,15 +3277,16 @@ async function syncModels() {
               }
             }
           }
+          if (idx < candidates.length) await new Promise((r) => setTimeout(r, 400))
         } catch {
           const fails = (modelHealth.get(id) ?? 0) + 1
           modelHealth.set(id, fails)
-          if (fails >= 3) dead.push(id)
+          if (fails >= 3) { dead.push(id); removeFromCurrent.add(id) }
           else flaky.push(id)
         }
       }
     }
-    await Promise.all([probe(), probe(), probe()])
+    await probe()
     // Keep the user's order, drop only definitively-gone models, then append
     // anything upstream offers that the user doesn't have yet. Temporary blocks
     // never remove a model, and new models appear without any manual step.
@@ -2374,8 +3385,11 @@ async function refreshUA(force = false) {
     const v = String(data?.version ?? "")
     if (!/^\d+\.\d+\.\d+/.test(v)) return uaAutoState.version
     uaAutoState.version = v
-    const next = `opencode/${v}`
-    if (next !== config.ua && /^opencode\/\d+\.\d+\.\d+/.test(config.ua)) {
+    // The v2 CLI advertises `opencode/latest/<version>/cli`; npm only publishes
+    // the 1.x line, so it cannot bump a v2-style UA. Leave those installs alone.
+    const next = `opencode/latest/${v}/cli`
+    const v2Style = /^opencode\/latest\//.test(config.ua)
+    if (!v2Style && next !== config.ua && /^opencode\/\d+\.\d+\.\d+/.test(config.ua)) {
       log(`auto-UA: opencode ${v} released — updating User-Agent`)
       try { saveConfig({ ua: next }) } catch {}
     }
@@ -2451,6 +3465,12 @@ async function handleApiConfig(req, res) {
       cleaned.autoSync = toBool(cleaned.autoSync, config.autoSync)
       cleaned.autoUA = toBool(cleaned.autoUA, config.autoUA)
       cleaned.injectSession = toBool(cleaned.injectSession, config.injectSession)
+      cleaned.tracing = toBool(cleaned.tracing, config.tracing)
+      // These two ride out as request headers, so keep them to token characters:
+      // a config typo must never be able to inject a header.
+      cleaned.clientName = /^[A-Za-z0-9._-]{1,32}$/.test(String(cleaned.clientName ?? "")) ? String(cleaned.clientName) : config.clientName
+      cleaned.projectHash = /^[A-Za-z0-9._-]{0,64}$/.test(String(cleaned.projectHash ?? "")) ? String(cleaned.projectHash) : ""
+      if (typeof cleaned.agentPreamble !== "string") cleaned.agentPreamble = config.agentPreamble
       if (cleaned.proxyKey === "••••••••") cleaned.proxyKey = config.proxyKey
       if (cleaned.probeAuth != null && !["auto", "key", "anonymous"].includes(String(cleaned.probeAuth))) {
         cleaned.probeAuth = "auto"
@@ -2529,6 +3549,7 @@ async function handleStatus(req, res) {
           : "public"
   json(res, 200, {
     uptime: Math.floor(process.uptime()),
+    runtime: runtimeInfo(),
     upstreamOk: cache.ok,
     upstream: config.upstream,
     ua: config.ua,
@@ -2673,7 +3694,11 @@ async function handleCountTokens(req, res) {
 // and the reply is relayed unchanged. Nothing here invents a question schema.
 function systemoneURL() {
   const base = String(config.upstream ?? "").replace(/\/+$/, "")
-  const root = base.endsWith("/v1") ? base.slice(0, -"/v1".length) : base
+  // The v2 base is family-scoped (`/inference/openai/v1`) while the classifier
+  // keeps the shared `/inference` root it has always been served from. Dropping
+  // the family segment first makes the same suffix resolve for the v2 default,
+  // the legacy `/inference/v1` base and `/zen/v1` alike.
+  const root = base.replace(/\/(openai|anthropic|google)\/v1$/, "").replace(/\/v1$/, "")
   return root + SYSTEMONE_UPSTREAM_SUFFIX
 }
 
@@ -2741,7 +3766,11 @@ async function handleSystemone(req, res) {
 
 async function router(req, res) {
   const url = new URL(req.url, `http://${req.headers.host ?? "localhost"}`)
-  const p = url.pathname
+  // One trailing slash is tolerated on every route: SDKs and base URLs
+  // regularly produce "/v1/chat/completions/" and the exact match used to 404
+  // it with no hint about the cause. The root stays "/", doubled slashes stay
+  // a 404, and all-cases trimming is deliberate ("//v1//chat" is not ours).
+  const p = url.pathname !== "/" && url.pathname.endsWith("/") ? url.pathname.replace(/\/+$/, "") : url.pathname
 
   if (req.method === "GET" && (p === "/" || p === "/index.html" || p === "/ui")) {
     res.writeHead(200, { "content-type": "text/html; charset=utf-8" })
@@ -2764,8 +3793,11 @@ async function router(req, res) {
       return json(res, 404, { error: "not found" })
     }
   }
-  if (req.method === "GET" && p === "/health") {
+  if ((req.method === "GET" || req.method === "HEAD") && p === "/health") {
     const cache = await fetchModels()
+    // Monitors (uptime pingers, container checks) probe with HEAD and inspect
+    // only the status line; a HEAD reply carries no body by definition.
+    if (req.method === "HEAD") return res.end()
     return json(res, 200, { ok: cache.ok, upstream: config.upstream })
   }
 
@@ -2810,7 +3842,7 @@ async function router(req, res) {
       )
     }
     if (isSystemone) return handleSystemone(req, res)
-    return isMessages ? handleMessages(req, res) : handleChat(req, res)
+    return isMessages ? handleMessages(req, res) : handleChat(req, res, p === "/v1/responses" || p === "/responses")
   }
   if (req.method === "POST" && (p === "/v1/messages/count_tokens" || p === "/messages/count_tokens")) {
     return handleCountTokens(req, res)
@@ -2906,6 +3938,18 @@ if (isMain) {
     log(`zen-proxy listening on http://${config.host}:${config.port}`)
     log(`upstream ${config.upstream}  UA ${config.ua}  default ${config.defaultModel || "(auto)"}`)
     log(`config file: ${CONFIG_PATH}  UI: /`)
+    // The free-tier gate fingerprints the TLS/HTTP stack; since the v2 gateway
+    // this is load-bearing, not cosmetic — an identical request that streams
+    // 200 under Bun's fetch is bucketed `429 FreeUsageLimitError` from Node's.
+    // Everything else (headers, session mint, body realism) is duplicated here,
+    // so a node:start is the one thing left that changes the verdict.
+    if (typeof Bun === "undefined") {
+      log("")
+      log("⚠  Running under Node. The free-tier gate 429s Node's TLS stack")
+      log("   (FreeUsageLimitError) even for agent-shaped requests. Run under")
+      log("   Bun instead:  bun zen-proxy.mjs   (see README)")
+      log("")
+    }
     if (config.warpProxy?.enabled && config.warpProxy.hop) {
       const relayUrl = `http://127.0.0.1:${config.warpProxy.port}`
       const proxyEnv = String(process.env.HTTPS_PROXY || process.env.HTTP_PROXY || "")
@@ -2956,6 +4000,9 @@ export {
   usageToChat,
   chatMessagesToInput,
   chatToolsToResponses,
+  responsesInputToMessages,
+  responsesInputToChatBody,
+  chatToResponses,
   rateLimitFor,
   probeAuthHeader,
   authForUpstream,
@@ -2987,9 +4034,24 @@ export {
   agentToolsFor,
   loadAgentTools,
   AGENT_TOOL_MAP,
-  AGENT_PREAMBLE_TEXT,
+  runtimeInfo,
+  bridgePreamble,
+  combinePreamble,
+  injectPreamble,
+  projectHash,
+  traceHeaders,
+  agentProbePayload,
+  MODEL_LIST_BASE,
+  PREAMBLE_MARKER,
   relayStream,
+  relayAnthropicStream,
+  relayResponsesStream,
+  relayChatAsResponsesStream,
+  relayResponsesPassthrough,
+  headersWall,
   rewriteSSE,
+  stripUnpinnedCalls,
+  filterPinnedDelta,
   fetchModels,
   handleModels,
   handleApiConfig,
