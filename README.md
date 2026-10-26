@@ -33,11 +33,13 @@
 
 ## This fork
 
-A fork of [12errh/zen-proxy](https://github.com/12errh/zen-proxy) that tracks `upstream/main` — a fork update is a plain `git pull` — and adds three opt-in things on top:
+A fork of [12errh/zen-proxy](https://github.com/12errh/zen-proxy) that tracks `upstream/main` — a fork update is a plain `git pull` — and adds these on top:
 
 - **Several Zen accounts on one endpoint.** `zenKeys`, or the `refs:` names listed in `zenKeysRefs` of `zenKeysFile` (for example `~/.dsh/.credentials.yaml`), form a pool: requests start on the next account in turn, a `401`/`429` hands the request to the following account, and the anonymous tier stays the last resort. `/api/status` reports the pool and each account's request count, masked.
-- **The System One classifier.** `POST /v1/systemone` relays `jev-*` requests unchanged, so a classifier can be used alongside the chat models. `jev-*` shows up on `/v1/models`; asking for one on a chat route comes back as a `400` that points at `/v1/systemone`.
+- **The System One classifier.** `POST /v1/systemone` relays `jev-*` requests unchanged, so a classifier can be used alongside the chat models. `jev-*` shows up on `/v1/models`; asking for one on a chat route comes back as a `400` that points at `/v1/systemone`. The relay resolves it from the shared `/inference` root, so it keeps working on the v2 base as well as the legacy `/inference/v1` and `/zen/v1` ones.
 - **A Cloudflare WARP hop.** `deploy/install-warp.sh` puts the upstream calls behind WARP through `scripts/warp-relay.mjs`, which falls back to a direct socket when the hop is down. See [WARP](#warp).
+- **The runtime and the v2 wire on the dashboard.** `/api/status` reports `runtime` (`bun 1.4.4`, `node …`), and the config tab shows it beside the hop together with the knobs the gate actually reads: preamble mode (`auto` / `off` / a custom text), `x-opencode-client`, the project hash, and `b3`/`traceparent` propagation. A `node` runtime is labelled "free tier needs bun", so a degraded install is visible instead of looking like a quota problem.
+- **No parking on a `429`.** A spent bucket and the gate's refusal share the `429 FreeUsageLimitError` payload, so the fork keeps walking — next account, then next model — and only then surfaces the upstream error. A probe that hits it lands in `rate-limited`, never `dead`, so a saturated hour cannot empty the model list.
 
 Everything else follows upstream, including `models.json`, the installer and the model-sync workflow.
 
