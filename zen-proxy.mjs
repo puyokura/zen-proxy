@@ -341,6 +341,7 @@ if (isMain) {
       setTimeout(() => {
         config = loadConfig()
         reloading = false
+        clearQuota("config reloaded")
         scheduleSync()
         scheduleUA()
         log("config reloaded")
@@ -1124,6 +1125,66 @@ function freeUsageExhausted(status, body) {
   return /FreeUsageLimit/i.test(t) || /free usage limit|usage limit reached|quota (exceeded|reached)/i.test(msg)
 }
 
+// The free allowance is shared by every account on an install and refills at a
+// fixed instant: upstream returns that instant as `retry-after` (UTC midnight in
+// the observed behaviour). Once it is spent, every account answers with the same
+// 429, so rotating the pool and walking the catalog can only repeat it.
+const quotaState = { until: 0, retryAfter: 0, at: 0, body: null, accounts: 0 }
+
+function quotaRemaining() {
+  if (!quotaState.until) return 0
+  const left = quotaState.until - Date.now()
+  if (left <= 0) {
+    quotaState.until = 0
+    quotaState.retryAfter = 0
+    quotaState.body = null
+    return 0
+  }
+  return left / 1000
+}
+
+function quotaBlocked() {
+  if (!quotaState.until) return false
+  if (poolKeys().length !== quotaState.accounts) {
+    clearQuota("account pool changed")
+    return false
+  }
+  return quotaRemaining() > 0
+}
+
+function noteQuotaExhausted(retryAfterSec, body) {
+  const secs = Number(retryAfterSec) > 0 ? Math.ceil(Number(retryAfterSec)) : 60
+  quotaState.until = Date.now() + secs * 1000
+  quotaState.retryAfter = secs
+  quotaState.at = Date.now()
+  quotaState.accounts = poolKeys().length
+  quotaState.body = body ?? null
+  log(`free quota exhausted — next window in ${Math.round(secs / 60)} min (${new Date(quotaState.until).toISOString()})`)
+}
+
+function clearQuota(why) {
+  if (!quotaState.until) return
+  quotaState.until = 0
+  quotaState.retryAfter = 0
+  quotaState.body = null
+  log(`free quota block cleared (${why})`)
+}
+
+function sendQuota(res, body, retryAfter) {
+  const headers = { "content-type": "application/json" }
+  if (retryAfter > 0) headers["retry-after"] = String(Math.ceil(retryAfter))
+  res.writeHead(429, headers)
+  res.end(JSON.stringify(body ?? { error: { type: "FreeUsageLimitError", message: "free usage limit reached" } }))
+}
+
+function sendAnthropicQuota(res, body, retryAfter) {
+  const e = anthropicError(429, body ?? { error: { type: "FreeUsageLimitError", message: "free usage limit reached" } })
+  const headers = { "content-type": "application/json" }
+  if (retryAfter > 0) headers["retry-after"] = String(Math.ceil(retryAfter))
+  res.writeHead(e.status, headers)
+  res.end(JSON.stringify(e.body))
+}
+
 // Key order for one request: the next pool key first (round-robin), then the
 // rest. A key the client sent is honoured as sent; `includePoolFallback` lets
 // the configured pool rescue a placeholder token, which is what Anthropic
@@ -1239,6 +1300,10 @@ async function handleMessages(req, res) {
     })
     return json(res, e.status, e.body)
   }
+  if (quotaBlocked()) {
+    recordReq(req, requested, Date.now() - start, 429)
+    return sendAnthropicQuota(res, quotaState.body, quotaRemaining())
+  }
   const isStream = !!body.stream
   // Route the credential the client sent. x-api-key is Anthropic's convention
   // and may legitimately be a real Zen key, so prefer it over the bearer token.
@@ -1312,14 +1377,6 @@ async function handleMessages(req, res) {
       }
 
       noteKeyUsed(auth, upstreamRes.status)
-      // A rejected account is swapped before the model is abandoned (same rule as
-      // the chat path), and the chain bounds how often that can happen.
-      if (keyRotationWorthy(upstreamRes.status, null) && ai + 1 < auths.length) {
-        log(`${keyLabel(auth)} rejected (${upstreamRes.status}) — retrying ${model} on the next account`)
-        auth = auths[++ai]
-        attempt--
-        continue
-      }
 
       if (upstreamRes.ok) {
         if (isStream) {
@@ -1353,13 +1410,18 @@ async function handleMessages(req, res) {
         lastErr = { error: { type: "api_error", message: `upstream returned ${upstreamRes.status}` } }
       }
       lastStatus = upstreamRes.status
-      const retryAfterMs = Math.min(parseRetryAfter(upstreamRes.headers.get("retry-after")) * 1000, 3000)
+      const retryAfter = parseRetryAfter(upstreamRes.headers.get("retry-after"))
+      const retryAfterMs = Math.min(retryAfter * 1000, 3000)
       if (freeUsageExhausted(upstreamRes.status, lastErr)) {
+        noteQuotaExhausted(retryAfter, lastErr)
         recordReq(req, requested, Date.now() - start, lastStatus)
-        const e = anthropicError(lastStatus, lastErr)
-        res.writeHead(e.status, { "content-type": "application/json" })
-        res.end(JSON.stringify(e.body))
-        return
+        return sendAnthropicQuota(res, lastErr, quotaRemaining())
+      }
+      if (keyRotationWorthy(upstreamRes.status, lastErr) && ai + 1 < auths.length) {
+        log(`${keyLabel(auth)} rejected (${upstreamRes.status}) — retrying ${model} on the next account`)
+        auth = auths[++ai]
+        attempt--
+        continue
       }
       if (transientUpstream(upstreamRes.status, lastErr) && attempt < retries) {
         delayMs = Math.max(config.retryBackoffMs * (attempt + 1), retryAfterMs)
@@ -1421,6 +1483,10 @@ async function handleChat(req, res) {
       },
     })
   }
+  if (quotaBlocked()) {
+    recordReq(req, requested, Date.now() - start, 429)
+    return sendQuota(res, quotaState.body, quotaRemaining())
+  }
   const isStream = !!body.stream
   const plan = upstreamAuths(req)
   if (plan.invalid) {
@@ -1480,15 +1546,6 @@ async function handleChat(req, res) {
       }
 
       noteKeyUsed(auth, upstreamRes.status)
-      // A rejected account is swapped before the model is abandoned: the model is
-      // fine, this credential is not. Each swap advances the chain, so the loop
-      // is bounded by the number of accounts.
-      if (keyRotationWorthy(upstreamRes.status, null) && ai + 1 < auths.length) {
-        log(`${keyLabel(auth)} rejected (${upstreamRes.status}) — retrying ${model} on the next account`)
-        auth = auths[++ai]
-        attempt--
-        continue
-      }
 
       if (upstreamRes.ok) {
         if (isStream) {
@@ -1540,12 +1597,18 @@ async function handleChat(req, res) {
         lastErr = { error: { type: "upstream_error", message: `upstream returned ${upstreamRes.status}` } }
       }
       lastStatus = upstreamRes.status
-      const retryAfterMs = Math.min(parseRetryAfter(upstreamRes.headers.get("retry-after")) * 1000, 3000)
+      const retryAfter = parseRetryAfter(upstreamRes.headers.get("retry-after"))
+      const retryAfterMs = Math.min(retryAfter * 1000, 3000)
       if (freeUsageExhausted(upstreamRes.status, lastErr)) {
+        noteQuotaExhausted(retryAfter, lastErr)
         recordReq(req, requested, Date.now() - start, lastStatus)
-        res.writeHead(lastStatus, { "content-type": "application/json" })
-        res.end(JSON.stringify(lastErr))
-        return
+        return sendQuota(res, lastErr, quotaRemaining())
+      }
+      if (keyRotationWorthy(upstreamRes.status, lastErr) && ai + 1 < auths.length) {
+        log(`${keyLabel(auth)} rejected (${upstreamRes.status}) — retrying ${model} on the next account`)
+        auth = auths[++ai]
+        attempt--
+        continue
       }
       if (transientUpstream(upstreamRes.status, lastErr) && attempt < retries) {
         delayMs = Math.max(config.retryBackoffMs * (attempt + 1), retryAfterMs)
@@ -2123,6 +2186,13 @@ function rewriteSSE(block, requested, strip = false) {
   return out.join("\n") + "\n\n"
 }
 
+function catalogHeaders() {
+  const pool = rotatedPool()
+  const headers = { "user-agent": config.ua }
+  if (pool.length) headers.authorization = pool[0]
+  return headers
+}
+
 let modelsCache = { at: 0, data: [], ok: false }
 let modelsFetching = null
 async function fetchModels() {
@@ -2130,10 +2200,16 @@ async function fetchModels() {
   if (modelsFetching) return modelsFetching
   modelsFetching = (async () => {
     try {
-      const res = await fetch(`${config.upstream}/models`, {
-        headers: { "user-agent": config.ua },
+      let res = await fetch(`${config.upstream}/models`, {
+        headers: catalogHeaders(),
         signal: AbortSignal.timeout(15_000),
       })
+      if (!res.ok) {
+        res = await fetch(`${config.upstream}/models`, {
+          headers: { "user-agent": config.ua },
+          signal: AbortSignal.timeout(15_000),
+        })
+      }
       if (res.ok) {
         const parsed = await res.json()
         const upstreamModels = parsed.data ?? []
@@ -2170,14 +2246,25 @@ async function fetchModels() {
 
 async function syncModels() {
   if (syncState.running) return syncState
+  if (quotaBlocked()) {
+    syncState.error = `free quota exhausted until ${new Date(quotaState.until).toISOString()}`
+    log(`auto-sync skipped: ${syncState.error}`)
+    return syncState
+  }
   syncState.running = true
   syncState.at = Date.now()
   const start = Date.now()
   try {
-    const res = await fetch(`${config.upstream}/models`, {
-      headers: { "user-agent": config.ua },
+    let res = await fetch(`${config.upstream}/models`, {
+      headers: catalogHeaders(),
       signal: AbortSignal.timeout(15_000),
     })
+    if (!res.ok) {
+      res = await fetch(`${config.upstream}/models`, {
+        headers: { "user-agent": config.ua },
+        signal: AbortSignal.timeout(15_000),
+      })
+    }
     if (!res.ok) throw new Error(`upstream /models → ${res.status}`)
     const parsed = await res.json()
     const upstreamIds = new Set((parsed.data ?? []).map((m) => m.id))
@@ -2540,6 +2627,12 @@ async function handleStatus(req, res) {
     warp: await relayStatus(),
     responsesModels: [...(config.responsesModels ?? [])],
     rateLimit: { max: config.rateLimitMax, windowMs: config.rateLimitWindowMs },
+    quota: {
+      blocked: quotaBlocked(),
+      until: quotaState.until || 0,
+      resetAt: quotaState.until ? new Date(quotaState.until).toISOString() : null,
+      retryAfter: Math.ceil(quotaRemaining()),
+    },
     probeAuth: config.probeAuth ?? "auto",
     models: {
       total: cache.data.length,
@@ -2611,6 +2704,7 @@ async function handleTest(req, res) {
       signal: AbortSignal.timeout(config.timeoutMs),
     })
     noteKeyUsed(auth, upstreamRes.status)
+    if (upstreamRes.ok) clearQuota("upstream answered a test request")
     if (upstreamRes.ok) {
       try { await upstreamRes.body?.cancel() } catch {}
     }
@@ -2691,6 +2785,10 @@ async function handleSystemone(req, res) {
   }
 
   const model = String(body.model ?? "")
+  if (quotaBlocked()) {
+    recordReq(req, model || "systemone", Date.now() - start, 429)
+    return sendQuota(res, quotaState.body, quotaRemaining())
+  }
   const plan = upstreamAuths(req)
   if (plan.invalid) {
     recordReq(req, model || "systemone", Date.now() - start, 401)
@@ -2728,6 +2826,10 @@ async function handleSystemone(req, res) {
       lastErr = { error: { type: "upstream_error", message: `upstream returned ${upstreamRes.status}` } }
     }
     lastStatus = upstreamRes.status
+    if (freeUsageExhausted(upstreamRes.status, lastErr)) {
+      noteQuotaExhausted(parseRetryAfter(upstreamRes.headers.get("retry-after")), lastErr)
+      break
+    }
     if (keyRotationWorthy(upstreamRes.status, lastErr) && ai + 1 < auths.length) {
       log(`${keyLabel(auth)} rejected (${upstreamRes.status}) — retrying systemone on the next account`)
       continue
@@ -2786,6 +2888,7 @@ async function router(req, res) {
       requestStats.recent = []
       requestStats.perMinute.clear()
       requestStats.window60 = []
+      clearQuota("api reset")
       return json(res, 200, { ok: true })
     }
     return json(res, 404, { error: "not found" })
@@ -3011,4 +3114,10 @@ export {
   sessionHeader,
   MAX_BODY,
   VALID_MODEL_ID,
+  freeUsageExhausted,
+  quotaState,
+  quotaBlocked,
+  quotaRemaining,
+  clearQuota,
+  noteQuotaExhausted,
 }

@@ -161,6 +161,7 @@ beforeEach(() => {
   if (originalConfig) zp.saveConfig(originalConfig)
   Object.assign(zp.requestStats, { total: 0, errors: 0, recent: [], perMinute: new Map(), window60: [] })
   Object.assign(zp.syncState, { at: 0, ok: false, running: false, ms: 0, working: [], rateLimited: [], flaky: [], gated: [], systemone: [], dead: [], error: "" })
+  zp.clearQuota("test reset")
 })
 beforeEach(() => {
   originalConfig = snapshotConfig()
@@ -1731,9 +1732,9 @@ describe("handleChat", () => {
     await zp.handleChat(req, res)
     assert.equal(res.state.status, 429)
     assert.match(res.body, /FreeUsageLimitError/)
-    // Two accounts plus the anonymous tier, then stop: the quota is account-wide,
-    // so the second model cannot answer and must not be tried.
-    assert.deepEqual(calls, ["space-bunny-free", "space-bunny-free", "space-bunny-free"])
+    // The allowance is shared by the accounts, so the first quota answer is the
+    // whole story: no second account, no second model.
+    assert.deepEqual(calls, ["space-bunny-free"])
   })
 
   test("free usage limit stops the Anthropic chain too", async () => {
@@ -1765,7 +1766,108 @@ describe("handleChat", () => {
     await zp.handleMessages(req, res)
     assert.equal(res.state.status, 429)
     assert.match(res.body, /rate_limit_error/)
-    assert.deepEqual(calls, ["space-bunny-free", "space-bunny-free", "space-bunny-free"])
+    assert.deepEqual(calls, ["space-bunny-free"])
+  })
+
+  test("the quota 429 keeps retry-after and records the window", async () => {
+    zp.saveConfig({
+      defaultZenKey: "",
+      zenKeys: ["key-a"],
+      zenKeysFile: "",
+      zenKeysRefs: [],
+      fallbackModels: ["space-bunny-free"],
+      defaultModel: "",
+      autoSyncIntervalMs: 0,
+      cacheMs: 0,
+    })
+    globalThis.fetch = routeFetch([
+      [
+        "/chat/completions",
+        () =>
+          jsonResponse(
+            { type: "error", error: { type: "FreeUsageLimitError", message: "Free usage limit reached." } },
+            429,
+            { "retry-after": "3600" },
+          ),
+      ],
+    ])
+    const res = mockRes()
+    await zp.handleChat(mockReq({ _body: JSON.stringify({ model: "space-bunny-free", messages: [] }) }), res)
+    assert.equal(res.state.status, 429)
+    assert.equal(res.state.headers["retry-after"], "3600", "the client learns when the window returns")
+    assert.ok(zp.quotaBlocked(), "the window is recorded for the next request")
+  })
+
+  test("while the window is spent the proxy answers without calling upstream", async () => {
+    zp.saveConfig({
+      defaultZenKey: "",
+      zenKeys: ["key-a"],
+      zenKeysFile: "",
+      zenKeysRefs: [],
+      fallbackModels: ["space-bunny-free"],
+      defaultModel: "",
+      autoSyncIntervalMs: 0,
+      cacheMs: 0,
+    })
+    zp.noteQuotaExhausted(900, { error: { type: "FreeUsageLimitError", message: "Free usage limit reached." } })
+    let calls = 0
+    globalThis.fetch = async () => {
+      calls++
+      throw new Error("must not reach upstream")
+    }
+    const res = mockRes()
+    await zp.handleChat(mockReq({ _body: JSON.stringify({ model: "space-bunny-free", messages: [] }) }), res)
+    assert.equal(calls, 0)
+    assert.equal(res.state.status, 429)
+    assert.ok(Number(res.state.headers["retry-after"]) > 800, "the remaining window is reported")
+    assert.match(res.body, /FreeUsageLimitError/)
+  })
+
+  test("the block ends with the recorded window", async () => {
+    zp.saveConfig({
+      defaultZenKey: "",
+      zenKeys: ["key-a"],
+      zenKeysFile: "",
+      zenKeysRefs: [],
+      fallbackModels: ["space-bunny-free"],
+      defaultModel: "",
+      autoSyncIntervalMs: 0,
+      cacheMs: 0,
+    })
+    zp.noteQuotaExhausted(1, {})
+    zp.quotaState.until = Date.now() - 1
+    globalThis.fetch = routeFetch([["/chat/completions", () => jsonResponse({ model: "ok", choices: [] })]])
+    const res = mockRes()
+    await zp.handleChat(mockReq({ _body: JSON.stringify({ model: "space-bunny-free", messages: [] }) }), res)
+    assert.equal(res.state.status, 200)
+  })
+
+  test("the hourly sync does not spend quota while the window is spent", async () => {
+    zp.noteQuotaExhausted(900, {})
+    let calls = 0
+    globalThis.fetch = async () => {
+      calls++
+      return jsonResponse({ data: [] })
+    }
+    const s = await zp.syncModels()
+    assert.equal(calls, 0)
+    assert.match(String(s.error), /quota exhausted/)
+  })
+
+  test("the model catalog is requested with an account key", async () => {
+    zp.saveConfig({ defaultZenKey: "", zenKeys: ["key-a"], zenKeysFile: "", zenKeysRefs: [], cacheMs: 0 })
+    let sent = null
+    globalThis.fetch = routeFetch([
+      [
+        "/models",
+        (u, opts) => {
+          sent = opts.headers?.authorization ?? null
+          return jsonResponse({ data: [{ id: "space-bunny-free" }] })
+        },
+      ],
+    ])
+    await zp.fetchModels()
+    assert.equal(sent, "Bearer key-a", "the account-scoped catalog is asked with the pool key")
   })
 
   test("non-retryable 400 propagates its status, not 429", async () => {
