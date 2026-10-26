@@ -3,8 +3,8 @@
 </p>
 
 <p align="center"><b>zen-proxy</b></p>
-<p align="center">Use OpenCode Zen's free models from any AI coding agent.</p>
-<p align="center"><sub>No account. No API key. OpenAI&nbsp;and&nbsp;Anthropic&nbsp;compatible. Runs on your machine.</sub></p>
+<p align="center">OpenCode Zen の無料モデルを、どの AI コーディングエージェントからでも。</p>
+<p align="center"><sub>アカウント不要・API キー不要。OpenAI と Anthropic に互換。手元で動きます。</sub></p>
 
 <p align="center">
   <a href="https://discord.gg/Dw5Ctrtuw">
@@ -13,7 +13,7 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-ccf73a?style=flat-square&labelColor=1a1612" alt="MIT License"></a>
   <img src="https://img.shields.io/badge/bun-1.2%2B%20(or%20node%2018%2B%20BYOK)-8b8b8b?style=flat-square&labelColor=1a1612" alt="Bun 1.2+">
   <img src="https://img.shields.io/badge/dependencies-0-8b8b8b?style=flat-square&labelColor=1a1612" alt="Zero dependencies">
-  <a href="#any-openai-compatible-agent">
+  <a href="#任意の-openai-互換エージェント">
     <img src="https://img.shields.io/badge/OpenAI_compatible-8b8b8b?style=flat-square&labelColor=1a1612&logo=openai" alt="OpenAI compatible">
   </a>
   <a href="#claude-code">
@@ -22,32 +22,34 @@
 </p>
 
 <p align="center">
-  <img src="assets/brag-demo.gif" alt="zen-proxy in 25 seconds: install → run the proxy → zen-claude → point any OpenAI-compatible agent at it" width="860" />
+  <img src="assets/brag-demo.gif" alt="zen-proxy を25秒で: インストール → 起動 → zen-claude → 任意の OpenAI 互換エージェントを接続" width="860" />
   <br />
   <sub>
-    <a href="assets/brag-demo.mp4">▶ full video with sound</a>
+    <a href="assets/brag-demo.mp4">▶ 音声つきの全編</a>
   </sub>
 </p>
 
 ---
 
-## This fork
+## このフォークについて
 
-A fork of [12errh/zen-proxy](https://github.com/12errh/zen-proxy) that tracks `upstream/main` — a fork update is a plain `git pull` — and adds these on top:
+[12errh/zen-proxy](https://github.com/12errh/zen-proxy) のフォークです。`upstream/main` を追従しているので、上流の更新は `git pull` だけで取り込めます。上流の挙動はそのままに、次の5つを足しています。
 
-- **Several Zen accounts on one endpoint.** `zenKeys`, or the `refs:` names listed in `zenKeysRefs` of `zenKeysFile` (for example `~/.dsh/.credentials.yaml`), form a pool: requests start on the next account in turn, a `401`/`429` hands the request to the following account, and the anonymous tier stays the last resort. `/api/status` reports the pool and each account's request count, masked.
-- **The System One classifier.** `POST /v1/systemone` relays `jev-*` requests unchanged, so a classifier can be used alongside the chat models. `jev-*` shows up on `/v1/models`; asking for one on a chat route comes back as a `400` that points at `/v1/systemone`. The relay resolves it from the shared `/inference` root, so it keeps working on the v2 base as well as the legacy `/inference/v1` and `/zen/v1` ones.
-- **A Cloudflare WARP hop.** `deploy/install-warp.sh` puts the upstream calls behind WARP through `scripts/warp-relay.mjs`, which falls back to a direct socket when the hop is down. See [WARP](#warp).
-- **The runtime and the v2 wire on the dashboard.** `/api/status` reports `runtime` (`bun 1.4.4`, `node …`), and the config tab shows it beside the hop together with the knobs the gate actually reads: preamble mode (`auto` / `off` / a custom text), `x-opencode-client`, the project hash, and `b3`/`traceparent` propagation. A `node` runtime is labelled "free tier needs bun", so a degraded install is visible instead of looking like a quota problem.
-- **No parking on a `429`.** A spent bucket and the gate's refusal share the `429 FreeUsageLimitError` payload, so the fork keeps walking — next account, then next model — and only then surfaces the upstream error. A probe that hits it lands in `rate-limited`, never `dead`, so a saturated hour cannot empty the model list.
+| 独自要素 | 何をするか |
+|---|---|
+| **複数アカウントのプール** | `zenKeys`、または `zenKeysFile` の `zenKeysRefs` に並べた `refs:` 名（例: `~/.dsh/.credentials.yaml`）を1つのプールとして使います。リクエストは次のアカウントから順に始まり、`401`/`429` が返ると次のアカウントへ渡し、最後の受け皿は匿名枠です。`/api/status` にプールと各アカウントの利用数（マスク済み）が出ます。 |
+| **System One 分類器** | `POST /v1/systemone` が `jev-*` のリクエストをそのまま中継します。`jev-*` は `/v1/models` にも並び、チャット系のルートへ投げると `/v1/systemone` を案内する `400` を返します。上流 URL は共有の `/inference` ルートから組み立てるので、v2 のベースでも旧 `/inference/v1`・`/zen/v1` でも動きます。 |
+| **Cloudflare WARP 経由** | `deploy/install-warp.sh` で上流への通信を WARP の先へ出します。中継は `scripts/warp-relay.mjs` で、WARP が落ちているときは直接接続へ切り替わります（[WARP](#warp)）。 |
+| **実行環境と v2 wire の可視化** | `/api/status` が `runtime`（`bun 1.4.4` / `node …`）を返し、設定タブがホップ情報と並べて表示します。ゲートが実際に見る値——preamble モード（`auto` / `off` / 任意テキスト）、`x-opencode-client`、project hash、`b3`/`traceparent`——も同じ画面で変えられます。`node` で動いているときは「free tier needs bun」と出るので、劣化した状態が枠切れに見えません。 |
+| **429 で止まらない** | 枠切れとゲートの拒否は同じ `429 FreeUsageLimitError` を返すため、区別できません。そこで止めず、次のアカウント → 次のモデルと進み、それでも駄目なときだけ上流のエラーを返します。プローブが踏んだ場合は `rate-limited` 扱いで `dead` にはしないので、混雑した時間帯にモデル一覧が空になりません。 |
 
-Everything else follows upstream, including `models.json`, the installer and the model-sync workflow.
+それ以外は上流どおりです。`models.json`、インストーラ、model-sync ワークフローも含みます。
 
 ---
 
-## Start here
+## はじめかた
 
-### Install
+### インストール
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/12errh/zen-proxy/main/install.sh | bash
@@ -57,9 +59,11 @@ curl -fsSL https://raw.githubusercontent.com/12errh/zen-proxy/main/install.sh | 
 irm https://raw.githubusercontent.com/12errh/zen-proxy/main/install.ps1 | iex
 ```
 
-<sub>That is the entire installation — no account, no API key, no `npm install`. Now pick your agent below.</sub>
+<sub>インストールはこれだけです。アカウントも API キーも `npm install` も要りません。あとは下から使うエージェントを選んでください。</sub>
 
 ---
+
+<a id="claude-code"></a>
 
 ### Claude Code
 
@@ -67,23 +71,25 @@ irm https://raw.githubusercontent.com/12errh/zen-proxy/main/install.ps1 | iex
 zen-claude
 ```
 
-<sub>Identical on Linux, macOS and Windows.</sub>
+<sub>Linux・macOS・Windows で同じコマンドです。</sub>
 
-It starts the proxy if it is not already running, loads every live free Zen model into Claude Code's `/model` picker, runs Claude Code, and stops the proxy again when you exit. Your existing Claude Code config is never touched.
+プロキシが起動していなければ起動し、いま使える無料 Zen モデルを Claude Code の `/model` に並べ、Claude Code を起動します。終了するとプロキシも止めます。既存の Claude Code 設定には触れません。
 
 ---
 
-### Any OpenAI-compatible agent
+<a id="任意の-openai-互換エージェント"></a>
 
-<sub>Cline, Roo Code, Continue, Aider, mimo, opencode forks — anything with a `baseURL` setting.</sub>
+### 任意の OpenAI 互換エージェント
 
-| Setting | Value |
+<sub>Cline、Roo Code、Continue、Aider、mimo、opencode 系フォークなど、`baseURL` を設定できるものなら何でも。</sub>
+
+| 設定 | 値 |
 |---|---|
 | Base URL | `http://127.0.0.1:8787/v1` |
-| API key | `public` |
-| Model | anything from `GET /v1/models` |
+| API キー | `public` |
+| モデル | `GET /v1/models` に出ているもの |
 
-Confirm the proxy is up:
+プロキシが上がっているか確認する:
 
 ```bash
 curl -s http://127.0.0.1:8787/health
@@ -91,116 +97,116 @@ curl -s http://127.0.0.1:8787/health
 ```
 
 <details>
-<summary>Run the proxy yourself</summary>
+<summary>プロキシを自分で起動する</summary>
 
 ```bash
-zen-proxy     # http://127.0.0.1:8787 — dashboard at /
+zen-proxy     # http://127.0.0.1:8787 — ダッシュボードは /
 ```
 
-It stays up until you stop it, so you point your agent at it once and keep using it. `zen-claude` does this for you and cleans up after.
+止めるまで動き続けるので、エージェントの接続先は一度設定すればそのまま使い回せます。`zen-claude` はこれを自動でやって、終了時に片づけます。
 </details>
 
 ---
 
-## What you get
+## 使えるもの
 
-| | |
+| 機能 | 内容 |
 |---|---|
-| `POST /v1/chat/completions` | OpenAI, streaming and not |
-| `POST /v1/responses` | OpenAI Responses API, translated both ways — a body that speaks Responses gets Responses back, a chat body keeps its chat reply |
-| `POST /v1/messages` | Anthropic Messages API — **this is the Claude Code one** |
-| `POST /v1/messages/count_tokens` | Anthropic token estimate |
-| `POST /v1/systemone` | System One classifier (`jev-1.13-free`) — request and reply relayed unchanged |
-| `GET /v1/models` | What's live right now |
-| Automatic fallback | Retries the next free model on `429` / `5xx` / unavailable |
-| Model aliases | Call it `gpt-4o`, get a free model back |
-| Auth | Anonymous `Bearer public`, your own Zen key, or several accounts rotated per request |
-| Dashboard | `http://127.0.0.1:8787/` |
+| `POST /v1/chat/completions` | OpenAI Chat Completions（ストリーミング／非ストリーミング） |
+| `POST /v1/responses` | OpenAI Responses API。両方向に変換します。Responses 形式で送れば Responses 形式で返り、chat 形式で送れば chat 形式の返りになります |
+| `POST /v1/messages` | Anthropic Messages API。**Claude Code はこれを使います** |
+| `POST /v1/messages/count_tokens` | Anthropic のトークン概算 |
+| `POST /v1/systemone` | System One 分類器（`jev-1.13-free`）。リクエストも応答もそのまま中継します |
+| `GET /v1/models` | いま動いているモデル一覧 |
+| 自動フォールバック | `429` / `5xx` / モデル利用不可のとき、次の無料モデルを試します |
+| モデルエイリアス | `gpt-4o` と呼べば、無料モデルが返ります |
+| 認証 | 匿名の `Bearer public`、自分の Zen キー、複数アカウントのリクエスト毎ローテーション |
+| ダッシュボード | `http://127.0.0.1:8787/` |
 
-The free-model catalog in [`models.json`](models.json) is refreshed from OpenCode's public catalog by a GitHub Action every 6 hours.
+無料モデルのカタログ [`models.json`](models.json) は、GitHub Action が OpenCode の公開カタログから6時間ごとに更新します。
 
 ---
 
-## Why a proxy is needed
+## なぜプロキシが必要か
 
-OpenCode's free models are served only to the OpenCode CLI itself. Everyone else gets one of:
+OpenCode の無料モデルは、OpenCode CLI 本体からしか使えません。それ以外のクライアントには次のどちらかが返ります。
 
 ```
 403 FreeTierError: OpenCode's free tier can only be used from within OpenCode
-429 FreeUsageLimitError: Free usage limit reached …   ← what you get instead now
+429 FreeUsageLimitError: Free usage limit reached …   ← いまはこちらが返る
 ```
 
-Since OpenCode 2, the second one is what a non-CLI client sees — with a `retry-after` window and zero personal usage. It is not your quota: it is the gate's verdict on the request.
+OpenCode 2 以降、CLI 以外のクライアントが受け取るのは2つ目です。`retry-after` の窓が付き、自分の利用量は0のまま。これはあなたの枠ではなく、リクエストに対するゲートの判定です。
 
-zen-proxy sits in front of that gateway and makes your agent's traffic indistinguishable from the CLI's, on three layers — all measured from a byte-capture of a real OpenCode 2.1.4 request.
+zen-proxy はそのゲートウェイの手前に立ち、エージェントの通信を CLI のものと見分けがつかない形にします。根拠はすべて、実際の OpenCode 2.1.4 のリクエストをバイト単位で採取した結果です。
 
 <details>
-<summary>What it actually changes</summary>
+<summary>実際に何を変えているか</summary>
 
-| Gateway requirement | What zen-proxy does |
+| ゲートの要求 | zen-proxy の対応 |
 |---|---|
-| **Run under Bun.** The gate fingerprints the TLS/HTTP stack — the exact bytes that stream `200` under Bun's fetch get `429 FreeUsageLimitError` from Node's (same second, same session) | `zen-proxy` / `zen-claude` prefer bun; node works with a BYOK key, and the proxy warns at boot under node |
-| The v2 endpoint `https://opencode.ai/inference/openai/v1` | Uses it, and migrates old configs pointing at `/inference/v1` or `/zen/v1` |
-| The v2 wire identity: `x-opencode-client`, `x-opencode-project` (sha1, per-install), `b3`/`traceparent`, affinity pair | Sends all of it, in the CLI's own formats |
-| The **OpenCode harness system text** — requests whose system prompt is not the CLI's harness preamble are refused however agent-shaped the rest is (a generic prompt, the opening line, or a ~1.8 KB cut of it are all refused) | Prepends the captured harness preamble (`agent-preamble.txt`) ahead of your agent's own instructions, on every route, idempotently |
-| OpenCode's own tool manifest (the gate refuses a bare `read` stub now) | Attaches the captured v2 manifest (`agent-tools.json`: read/edit/glob/grep/shell/write are the ones whose name your agent maps to) ahead of your tools, renames the mapped calls back to your agent's names, and drops the rest |
-| Streams with `stream_options` and a real `max_completion_tokens` | Mirrors the CLI's shape on health probes, and forwards yours untouched |
+| **Bun で動くこと。** ゲートは TLS/HTTP スタックの指紋を見ます。Bun の fetch なら `200` で流れるバイト列が、Node の fetch では同じ秒・同じセッションでも `429 FreeUsageLimitError` になります | `zen-proxy` / `zen-claude` は bun を優先します。node は BYOK キーなら動き、node 起動時は警告を出します |
+| v2 エンドポイント `https://opencode.ai/inference/openai/v1` | これを使います。`/inference/v1` や `/zen/v1` を指した古い設定は自動で移行します |
+| v2 の wire 同一性: `x-opencode-client`、`x-opencode-project`（インストール毎の sha1）、`b3`/`traceparent`、affinity ペア | CLI と同じ形式で全部送ります |
+| **OpenCode のハーネス system テキスト**。CLI の preamble でない system プロンプトは、他がどれだけエージェントらしくても拒否されます（汎用プロンプト、冒頭1行だけ、約1.8KB で切ったもの、いずれも拒否） | 採取したハーネス preamble（`agent-preamble.txt`）を、エージェント自身の指示の前に、全ルートで、二重にならない形で前置します |
+| OpenCode 自身のツール目録（`read` のスタブだけでは通りません） | 採取した v2 目録（`agent-tools.json`。名前が対応するのは read/edit/glob/grep/shell/write）を自分のツールの前に付け、対応する呼び出しはエージェント側の名前に戻し、残りは捨てます |
+| `stream_options` と実際の `max_completion_tokens` を伴うストリーム | ヘルスプローブでは CLI の形を再現し、あなたのリクエストはそのまま転送します |
 
-**Run it with bun** (`bun zen-proxy.mjs`, or through `zen-proxy`/`zen-claude`, which pick bun when present): that is the one requirement node cannot substitute away — the gateway 429s node's stack even though headers, sessions and bodies are byte-identical.
+**bun で動かしてください**（`bun zen-proxy.mjs`、または bun があればそれを選ぶ `zen-proxy`/`zen-claude` 経由）。これだけは node で代用できません。ヘッダもセッションもボディもバイト単位で同じでも、ゲートは node のスタックを 429 にします。
 
-For replies, one rule: a reply may only carry calls your agent can actually run. An agent turn with its own tools keeps its calls (mapped manifest calls come back renamed) and loses everything else — manifest names it has no counterpart for, and tool names the provider invents; a `tool_choice`-pinned turn keeps only the pinned call; a reply with no tools attached at all (title generators, plain pings) is stripped of every `tool_call`. Health probes send the same harness preamble + manifest + a real ask (serially, spaced out — the gate blanket-403s a rapid model-hop burst from one identity), so a model in the dashboard's `ok` row genuinely answered; the old `rate-limited` parking behaviour is gone (a `FreeUsageLimitError` bucket no longer removes or dead-labels a model).
+応答についてはルールが1つだけあります。**返信は、エージェントが実際に実行できる呼び出しだけを持てる。** 自分のツールを持つターンは、その呼び出しを保持し（目録由来の呼び出しは名前を戻して返します）、それ以外——対応のない目録の名前や、プロバイダが勝手に作ったツール名——は落とします。`tool_choice` で1つに固定したターンは、その固定した呼び出しだけを残します。ツールを一切付けていない返信（タイトル生成や単純な ping）は、`tool_call` を全部落とします。ヘルスプローブも同じハーネス preamble + 目録 + 実際の問いを送ります（直列で、間隔を空けて。同一 identity からの連続モデルホップはまとめて 403 になるため）。だからダッシュボードの `ok` 行は「本当に応答が流れた」という意味になります。以前の `rate-limited` での待避はなくなりました（`FreeUsageLimitError` のバケットがモデルを削除したり dead 扱いしたりすることはありません）。
 </details>
 
 <details>
-<summary>Gotchas worth knowing before you file a bug</summary>
+<summary>バグ報告の前に知っておきたいこと</summary>
 
-- **This rides an anonymous free tier.** Per-IP quotas, shared pool, sometimes saturated. Bring a key if you need reliability.
-- **A bare `curl` gets 429/403.** The gateway only answers genuine *agent* traffic (harness preamble, manifest, plausible wire) — every agent above does this; a hand-rolled chat client won't.
-- **Health probes are agent-shaped.** Sync sends each model the same thing a real v2 client sends — harness preamble, OpenCode's manifest, `stream_options`, a real token budget — serially, with a beat between hops (a rapid burst from one identity is blanket-refused), so `ok` means the model actually streamed. A `FreeUsageLimitError` probe never marks a model dead or drops it from your list.
-- **Fallbacks announce themselves** via `zen_served_by` and the `x-zen-served-by` / `x-zen-fallback` headers.
-- **`agent-tools.json` and `agent-preamble.txt` are captures of OpenCode v2.1.4's request.** If OpenCode changes its harness text or tool schemas, re-capture both from any real request (the gate fingerprints the preamble; the first 139 characters are not enough). The preamble file is plain text; the tools file accepts a bare array or `{"tools":[...]}`.
+- **匿名の無料枠に乗っています。** IP 単位の枠、共有プール、混雑する時間帯があります。安定させたいならキーを持ってきてください。
+- **素の `curl` は 429/403 になります。** ゲートウェイは本物の*エージェント*の通信（ハーネス preamble、目録、それらしい wire）にしか応じません。上のエージェントはどれもこれを満たしますが、手作りのチャットクライアントは満たしません。
+- **ヘルスプローブはエージェントの形をしています。** 同期は各モデルに、本物の v2 クライアントと同じもの——ハーネス preamble、OpenCode の目録、`stream_options`、実際のトークン予算——を、直列で間隔を空けて送ります（同一 identity からの連続アクセスはまとめて拒否されるため）。なので `ok` は「実際にストリームが返った」という意味です。`FreeUsageLimitError` のプローブがモデルを dead にしたり一覧から消したりすることはありません。
+- **フォールバックは名乗ります。** `zen_served_by` と `x-zen-served-by` / `x-zen-fallback` ヘッダで分かります。
+- **`agent-tools.json` と `agent-preamble.txt` は OpenCode v2.1.4 のリクエストの採取物です。** OpenCode がハーネス文言やツールスキーマを変えたら、本物のリクエストから両方を取り直してください（ゲートは preamble の指紋を見ます。先頭139文字では足りません）。preamble はプレーンテキスト、tools は素の配列でも `{"tools":[...]}` でも読めます。
 </details>
 
 ---
 
-## Configuration
+## 設定
 
-`zen-proxy.json`, created on first run, hot-reloaded, and editable from the dashboard. Environment variables override at startup.
+`zen-proxy.json` は初回起動時に作られ、ホットリロードされ、ダッシュボードから編集できます。環境変数は起動時に優先されます。
 
 <details>
-<summary>Keys</summary>
+<summary>キー</summary>
 
-| Key | Default | Description |
+| キー | 既定値 | 説明 |
 |---|---|---|
-| `host` / `port` | `127.0.0.1` / `8787` | Bind address (restart required) |
-| `upstream` | `https://opencode.ai/inference/openai/v1` | Zen gateway base (v2; discovery stays on `/inference/v1`) |
-| `ua` / `autoUA` | `opencode/latest/2.1.4/cli` / `true` | The v2 CLI's UA format; auto-tracking skips v2-style UAs (npm only carries 1.x) |
-| `clientName` / `projectHash` / `tracing` | `cli` / auto / `true` | The v2 identity headers: `x-opencode-client`, per-install `x-opencode-project` (sha1 of `directory:<cwd>`), `b3`/`traceparent` |
-| `injectSession` | `true` | Mint and send the session header pair + affinity pair |
-| `agentPreamble` | `""` (= auto) | `""`/`auto` → shipped harness preamble; `off`/`none` → none; other text → used verbatim |
-| `agentTools` | `true` | Attach OpenCode's v2 manifest to every request, ahead of your agent's tools; replies keep only the calls your agent can run — mapped ones renamed back, the rest dropped |
-| `defaultModel` | `""` | Empty = auto-pick the first working free model |
-| `fallbackModels` | *(from [`models.json`](models.json))* | Tried in order on failure. Omit to follow the catalog; save once to pin your own list |
-| `modelAliases` | `{}` | e.g. `{"gpt-4o": "deepseek-v4.1-flash-free"}` |
-| `responsesModels` | `["gpt-5*","gpt-6*","grok-*","muse-spark-*"]` | Models served on `/v1/responses`; patterns may end in `*` |
-| `defaultZenKey` | `""` | Your own Zen key instead of anonymous `public` |
-| `zenKeys` / `zenKeysFile` / `zenKeysRefs` | `[]` / `""` / `[]` | More Zen credentials: a key list, or the `refs:` names to read out of a credentials file such as `~/.dsh/.credentials.yaml`. Two or more accounts are rotated per request; a key answering `401`/`429` passes the request to the next one, and the anonymous tier stays the last resort. |
-| `proxyKey` | `""` | Require this from clients; also locks the dashboard and `/api/*` |
-| `rateLimitMax` / `rateLimitWindowMs` | `0` (off) / `60000` | Per-client rate limiting |
-| `timeoutMs` / `cacheMs` | `120000` / `30000` | Upstream timeout, `/v1/models` cache TTL |
-| `autoSync` / `autoSyncIntervalMs` | `true` / `3600000` | Runtime discovery of newly-offered free models |
-| `trustForwarded` | `false` | Honour `x-forwarded-for` behind a reverse proxy |
-| `warpProxy` | `{ "enabled": false, "port": 8890, "hop": "", "fallback": "direct" }` | Send the upstream calls through a local relay that tunnels over an HTTP CONNECT proxy — Cloudflare WARP in proxy mode, or any CONNECT proxy. The relay falls back to a direct socket when the hop is down. See [WARP](#warp) |
+| `host` / `port` | `127.0.0.1` / `8787` | バインド先（変更には再起動が必要） |
+| `upstream` | `https://opencode.ai/inference/openai/v1` | Zen ゲートウェイのベース（v2。カタログ取得だけは `/inference/v1` のまま） |
+| `ua` / `autoUA` | `opencode/latest/2.1.4/cli` / `true` | v2 CLI の UA 形式。自動追従は v2 形式の UA には触れません（npm にあるのは 1.x 系だけ） |
+| `clientName` / `projectHash` / `tracing` | `cli` / 自動 / `true` | v2 の同一性ヘッダ: `x-opencode-client`、インストール毎の `x-opencode-project`（`directory:<cwd>` の sha1）、`b3`/`traceparent` |
+| `injectSession` | `true` | セッションヘッダのペアと affinity ペアを生成して送る |
+| `agentPreamble` | `""`（= auto） | `""`/`auto` → 同梱のハーネス preamble、`off`/`none` → 付けない、それ以外 → その文字列をそのまま使う |
+| `agentTools` | `true` | OpenCode の v2 目録を全リクエストで自分のツールの前に付ける。応答はエージェントが実行できる呼び出しだけを残し、対応するものは名前を戻し、残りは捨てる |
+| `defaultModel` | `""` | 空 = 動く無料モデルの先頭を自動で選ぶ |
+| `fallbackModels` | *[`models.json`](models.json) から* | 失敗時に順番に試す。省略するとカタログに追従。一度保存すると自分の一覧に固定 |
+| `modelAliases` | `{}` | 例: `{"gpt-4o": "deepseek-v4.1-flash-free"}` |
+| `responsesModels` | `["gpt-5*","gpt-6*","grok-*","muse-spark-*"]` | `/v1/responses` で扱うモデル。パターンは `*` で終われます |
+| `defaultZenKey` | `""` | 匿名の `public` の代わりに使う自分の Zen キー |
+| `zenKeys` / `zenKeysFile` / `zenKeysRefs` | `[]` / `""` / `[]` | Zen の資格情報を追加します。キーの配列か、`~/.dsh/.credentials.yaml` のような資格情報ファイルから読む `refs:` 名。2つ以上あるとリクエスト毎にローテーションし、`401`/`429` を返したキーは次のキーへ渡し、匿名枠は最後の受け皿として残ります。 |
+| `proxyKey` | `""` | クライアントにこれを要求します。ダッシュボードと `/api/*` もロックされます |
+| `rateLimitMax` / `rateLimitWindowMs` | `0`（無効） / `60000` | クライアント単位のレート制限 |
+| `timeoutMs` / `cacheMs` | `120000` / `30000` | 上流のタイムアウト、`/v1/models` のキャッシュ TTL |
+| `autoSync` / `autoSyncIntervalMs` | `true` / `3600000` | 新しく出た無料モデルの実行時ディスカバリ |
+| `trustForwarded` | `false` | リバースプロキシ配下で `x-forwarded-for` を信頼する |
+| `warpProxy` | `{ "enabled": false, "port": 8890, "hop": "", "fallback": "direct" }` | 上流への通信を、HTTP CONNECT プロキシ経由でトンネルするローカル中継に通します（Cloudflare WARP のプロキシモード、または任意の CONNECT プロキシ）。中継はホップが落ちていれば直接ソケットに切り替わります。[WARP](#warp) を参照 |
 
 `HOST` `PORT` `ZEN_URL` `ZEN_UA` `ZEN_CLIENT` `ZEN_PROJECT_HASH` `ZEN_TRACING=0` `INJECT_SESSION=0` `AUTO_UA=0` `UA_REFRESH_MS` `AGENT_TOOLS=0` `AGENT_PREAMBLE=off` `ZEN_PROXY_AGENT_TOOLS` `ZEN_PROXY_AGENT_PREAMBLE` `PROBE_AUTH` `DEFAULT_MODEL` `FALLBACK_MODELS` `MODEL_ALIASES` `RESPONSES_MODELS` `PROXY_KEY` `ZEN_KEY` `ZEN_KEYS` `ZEN_KEYS_FILE` `ZEN_KEYS_REFS` `TRUST_FORWARDED=1` `TIMEOUT_MS` `CACHE_MS` `RATE_LIMIT_MAX` `RATE_LIMIT_WINDOW_MS` `AUTO_SYNC=0` `AUTO_SYNC_MS` `WARP_PROXY_ENABLED=0` `WARP_PROXY_PORT` `WARP_PROXY_HOP` `WARP_PROXY_FALLBACK` `ZEN_PROXY_CONFIG`
 
-Anonymous `public` access shares a per-IP quota that is sometimes saturated. Set `defaultZenKey`, or send `x-zen-key` per request, for steadier service. With several accounts configured (`zenKeys` or the refs of `zenKeysFile`) they are used in turn, so a per-account quota is no longer the ceiling; `/api/status` reports the pool and per-account request counts, masked.
+匿名の `public` アクセスは IP 単位の枠を共有していて、混雑することがあります。安定させたいなら `defaultZenKey` を設定するか、リクエスト毎に `x-zen-key` を送ってください。複数アカウント（`zenKeys`、または `zenKeysFile` の refs）を設定すると順番に使われるので、1アカウントあたりの枠が上限ではなくなります。`/api/status` にプールと各アカウントの利用数（マスク済み）が出ます。
 </details>
 
 <details>
-<summary>Dashboard</summary>
+<summary>ダッシュボード</summary>
 
-`http://127.0.0.1:8787/` — upstream health and uptime, a live request feed, one-click model testing, instant config editing, and a log tail.
+`http://127.0.0.1:8787/` — 上流の死活と稼働時間、リクエストのライブ表示、モデルのワンクリック試験、設定の即時編集、ログの末尾表示。
 
 ![zen-proxy dashboard](assets/dashboard.png)
 </details>
@@ -208,33 +214,33 @@ Anonymous `public` access shares a per-IP quota that is sometimes saturated. Set
 <details>
 <summary>HTTP API</summary>
 
-| Method | Path | Description |
+| メソッド | パス | 説明 |
 |---|---|---|
 | `POST` | `/v1/chat/completions` | OpenAI Chat Completions |
 | `POST` | `/v1/responses` | OpenAI Responses API |
 | `POST` | `/v1/messages` | Anthropic Messages API |
-| `POST` | `/v1/messages/count_tokens` | Anthropic token estimate |
-| `GET` | `/v1/models` | Available models |
-| `GET` | `/health` | Health check (always open) |
-| `GET` | `/` | Dashboard |
-| `GET`/`PUT` | `/api/config` | Read / update configuration |
-| `GET` | `/api/status` | Stats and upstream health |
-| `POST` | `/api/test` | Test one model — `{"model":"..."}` |
-| `GET` | `/api/logs` | Log tail |
-| `POST` | `/api/sync` | Re-run model discovery |
-| `POST` | `/api/reset` | Reset request statistics |
+| `POST` | `/v1/messages/count_tokens` | Anthropic のトークン概算 |
+| `GET` | `/v1/models` | 利用できるモデル |
+| `GET` | `/health` | ヘルスチェック（常に開いています） |
+| `GET` | `/` | ダッシュボード |
+| `GET`/`PUT` | `/api/config` | 設定の読み書き |
+| `GET` | `/api/status` | 統計と上流の状態 |
+| `POST` | `/api/test` | モデルを1つ試す — `{"model":"..."}` |
+| `GET` | `/api/logs` | ログの末尾 |
+| `POST` | `/api/sync` | モデルディスカバリをやり直す |
+| `POST` | `/api/reset` | リクエスト統計をリセット |
 </details>
 
 <details>
-<summary>Running as a service (Linux)</summary>
+<summary>サービスとして常駐させる（Linux）</summary>
 
-`install.sh` offers to install a systemd unit (which prefers `bun` when it is on `PATH`), or:
+`install.sh` が systemd ユニットのインストールを提案します（`PATH` に `bun` があれば bun を優先します）。手動なら:
 
 ```bash
 sudo systemctl enable --now zen-proxy
 ```
 
-With Bun installed outside `PATH` (for example `~/.bun/bin/bun`), point the unit at it explicitly — the free tier does not answer Node's stack:
+Bun が `PATH` の外にある場合（例: `~/.bun/bin/bun`）は、ユニットから明示的に指してください。無料枠は Node のスタックには応じません:
 
 ```ini
 ExecStart=/home/<user>/.bun/bin/bun /path/to/zen-proxy.mjs
@@ -242,21 +248,21 @@ ExecStart=/home/<user>/.bun/bin/bun /path/to/zen-proxy.mjs
 </details>
 
 <details>
-<summary>Doing it by hand instead of using <code>zen-claude</code></summary>
+<summary><code>zen-claude</code> を使わずに手で動かす</summary>
 
-Both launchers pass `--settings` rather than exported env vars — **Claude Code reads env from `~/.claude/settings.json`, and that wins over your shell**, so an `export` is silently ignored if that file already sets `ANTHROPIC_BASE_URL`. Your existing config is left alone; a plain `claude` still uses it.
+どちらのランチャーも、環境変数を export せず `--settings` を渡します。**Claude Code は `~/.claude/settings.json` の env を読み、それがシェルより優先される**ため、そのファイルがすでに `ANTHROPIC_BASE_URL` を設定していると `export` は黙って無視されます。既存の設定はそのまま残り、素の `claude` は今までどおりそれを使います。
 
 ```bash
 claude --settings ./claude/zen-proxy.settings.json
 ```
 
-The generated picker comes from `bin/make-settings.mjs`, which reads the live model list from the proxy (falling back to `models.json`). Each row sets `behavesAs` so Claude Code handles an unfamiliar model id sensibly while still sending that exact id upstream.
+ピッカーは `bin/make-settings.mjs` が生成します。プロキシから実際のモデル一覧を読み（取れなければ `models.json`）、各行に `behavesAs` を設定します。Claude Code は見慣れないモデル ID でも妥当な既定値で扱え、上流へはその ID がそのまま送られます。
 
-If `zen-claude` says `command not found`, check `ls -l ~/.local/bin/zen-claude` first — if the symlink is missing, re-run the installer. Only if it exists is it a stale `PATH`:
+`zen-claude` が `command not found` になる場合は、まず `ls -l ~/.local/bin/zen-claude` を見てください。シンボリックリンクが無ければインストーラを再実行します。リンクがあるのに見つからない場合だけ、`PATH` が古いのが原因です:
 
 ```bash
-export PATH="$HOME/.local/bin:$PATH"                          # this terminal
-echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc      # permanent
+export PATH="$HOME/.local/bin:$PATH"                          # この端末だけ
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc      # 永続化
 ```
 </details>
 
@@ -264,27 +270,27 @@ echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc      # permanent
 
 ## WARP
 
-Put the upstream calls behind [Cloudflare WARP](https://developers.cloudflare.com/cloudflare-one/team-and-resources/devices/cloudflare-one-client/download/). Two reasons it comes up: the free tier is bound to the exit address, and a shared or blocked exit is refused outright — upstream answers `FreeTierError: free models aren't available from your current network because we've detected abusive traffic from this IP address`.
+上流への通信を [Cloudflare WARP](https://developers.cloudflare.com/cloudflare-one/team-and-resources/devices/cloudflare-one-client/download/) の先へ出します。話に出る理由は2つ。無料枠が出口アドレスに紐づくこと、共有・ブロック済みの出口は問答無用で拒否されることです。後者のとき上流は `FreeTierError: free models aren't available from your current network because we've detected abusive traffic from this IP address` を返します。
 
-The hop is an HTTP CONNECT proxy. Cloudflare WARP in proxy mode speaks it on `127.0.0.1:40000`, and so does any other CONNECT proxy. It is reached through a small relay, `scripts/warp-relay.mjs`, because Node's env proxy has no failover: without the relay a stopped WARP service would take every upstream call down with it. The relay opens each tunnel over the hop and falls back to a direct socket when the hop is unreachable, so the proxy stays usable either way.
+ホップは HTTP CONNECT プロキシです。Cloudflare WARP のプロキシモードは `127.0.0.1:40000` で喋り、他の CONNECT プロキシも同じです。そこへは小さな中継 `scripts/warp-relay.mjs` を介します。Node の環境変数プロキシにはフェイルオーバーが無く、中継が無いと WARP が止まった瞬間に上流への通信が全滅するためです。中継はトンネルをホップ経由で開き、ホップに届かなければ直接ソケットに切り替えるので、どちらでもプロキシは使えます。
 
 ```bash
-sudo bash deploy/install-warp.sh          # WARP + relay unit + zen-proxy drop-in
-curl -s http://127.0.0.1:8890/__status    # tunnel counters, hop vs direct
-curl -s http://127.0.0.1:8787/api/status  # the same numbers, from the dashboard
+sudo bash deploy/install-warp.sh          # WARP + 中継ユニット + zen-proxy の drop-in
+curl -s http://127.0.0.1:8890/__status    # トンネル数、ホップ経由か直接か
+curl -s http://127.0.0.1:8787/api/status  # 同じ数字をダッシュボード側から
 ```
 
-What it installs:
+インストールされるもの:
 
-| Piece | Where | What it does |
+| 部品 | 場所 | 役割 |
 |---|---|---|
-| `cloudflare-warp` | apt (official repo) | The hop itself, in proxy mode; the host's routing is untouched |
-| `zen-proxy-warp-relay.service` | `/etc/systemd/system` | Runs the relay on `127.0.0.1:8890` |
-| `zen-proxy.service.d/warp-proxy.conf` | `/etc/systemd/system` | `NODE_USE_ENV_PROXY=1` and `HTTPS_PROXY=http://127.0.0.1:8890` |
+| `cloudflare-warp` | apt（公式リポジトリ） | ホップ本体。プロキシモードで動き、ホストのルーティングには触れません |
+| `zen-proxy-warp-relay.service` | `/etc/systemd/system` | 中継を `127.0.0.1:8890` で動かす |
+| `zen-proxy.service.d/warp-proxy.conf` | `/etc/systemd/system` | `NODE_USE_ENV_PROXY=1` と `HTTPS_PROXY=http://127.0.0.1:8890` |
 
-Both runtimes read those variables when the process starts — Bun uses `HTTPS_PROXY` directly, Node needs `NODE_USE_ENV_PROXY=1` alongside it — so the drop-in is the only place that can turn the hop on: set them in the unit, not in a shell. The relay's port has to match `HTTPS_PROXY`; both default to `8890`.
+どちらのランタイムもプロセス起動時にこの変数を読みます（Bun は `HTTPS_PROXY` を直接、Node は `NODE_USE_ENV_PROXY=1` も必要）。つまりホップを有効にできるのはこの drop-in だけで、シェルで設定しても効きません。中継のポートは `HTTPS_PROXY` と一致させてください。既定はどちらも `8890` です。
 
-Roll back:
+元に戻す:
 
 ```bash
 sudo systemctl disable --now zen-proxy-warp-relay
@@ -294,18 +300,18 @@ sudo systemctl daemon-reload && sudo systemctl restart zen-proxy
 sudo warp-cli --accept-tos registration delete && sudo apt-get remove -y cloudflare-warp
 ```
 
-Two things worth knowing before you turn it on: the upstream then sees the WARP exit address instead of yours, and WARP hands out a different exit address per connection, so a quota tied to one address is not guaranteed to follow you.
+有効にする前に知っておきたいことが2つあります。上流から見えるのは自分のアドレスではなく WARP の出口アドレスになること、WARP は接続ごとに別の出口を割り当てるため、1つのアドレスに紐づいた枠が付いてくる保証はないことです。
 
 ---
 
 <p align="center">
-  <sub>💬 <a href="https://discord.gg/Dw5Ctrtuw">Join the Discord</a> — install help, troubleshooting, and which free model is fast right now.</sub>
+  <sub>💬 <a href="https://discord.gg/Dw5Ctrtuw">Discord に参加</a> — インストールの相談、トラブルシュート、いま速い無料モデルの情報。</sub>
   <br />
-  <sub>The demo video up top was built using the brag skill.</sub>
+  <sub>冒頭のデモ動画は brag スキルで作りました。</sub>
 </p>
 
 <p align="center">
-  <sub>Machine-readable: <a href="llms.txt">llms.txt</a> &nbsp;·&nbsp; <a href="llms-full.txt">llms-full.txt</a></sub>
+  <sub>機械可読版: <a href="llms.txt">llms.txt</a> &nbsp;·&nbsp; <a href="llms-full.txt">llms-full.txt</a></sub>
 </p>
 
 <p align="center">
