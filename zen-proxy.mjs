@@ -1525,7 +1525,7 @@ function noteKeyUsed(auth, status) {
   // Keep the account out of the next few rotations: a spent key must not spend
   // the shared bucket ahead of a working credential.
   const raw = String(auth ?? "").replace(/^Bearer\s+/, "")
-  if (status === 429) blockKey(raw, 60_000)
+  if (status === 429) blockKey(raw, 120_000)
   else if (status === 401) blockKey(raw, 600_000)
   else if (status >= 200 && status < 300) clearKeyBlock(raw)
 }
@@ -1713,6 +1713,7 @@ async function handleMessages(req, res) {
   let fatalGate = false
   let lastRetryAfter = 0
   let egressReturnPath = ""
+  let anonRetried = false
   if (res.setHeader) res.setHeader("x-zen-egress", egressState.active)
   // The model the client chose is tried first; transient failures are retried
   // against that same model before the chain moves on.
@@ -1855,6 +1856,16 @@ async function handleMessages(req, res) {
       const gateKind = config.freeTierFastFail ? gateRefusalKind(lastStatus, lastErr) : ""
       if (gateKind === "quota") {
         lastRetryAfter = Math.max(lastRetryAfter, parseRetryAfter(upstreamRes.headers.get("retry-after")))
+        // The shared bucket refuses in short bursts: a single anonymous request
+        // that is refused right after a pool sweep often answers 200 a moment
+        // later (measured: 3 of 4 simultaneous requests succeeded while the
+        // sequential ones were refused). One short retry, then the verdict.
+        if (auth === "Bearer public" && phase === 0 && !anonRetried && !(egressState.unhealthyUntil[egressState.active] > Date.now())) {
+          anonRetried = true
+          await new Promise((r) => setTimeout(r, 700))
+          attempt = -1
+          continue
+        }
         // A key's 429 is that key's own quota: it stops the sweep but says
         // nothing about the exit. The anonymous tier is the exit probe - if it
         // is refused, the path is refused, and the request gets one try on the
@@ -1980,6 +1991,7 @@ async function handleChat(req, res, responsesRoute = false) {
   let fatalGate = false
   let lastRetryAfter = 0
   let egressReturnPath = ""
+  let anonRetried = false
   if (res.setHeader) res.setHeader("x-zen-egress", egressState.active)
   // The model the client chose is tried first; transient failures are retried
   // against that same model before the chain moves on.
@@ -2185,6 +2197,16 @@ async function handleChat(req, res, responsesRoute = false) {
       const gateKind = config.freeTierFastFail ? gateRefusalKind(lastStatus, lastErr) : ""
       if (gateKind === "quota") {
         lastRetryAfter = Math.max(lastRetryAfter, parseRetryAfter(upstreamRes.headers.get("retry-after")))
+        // The shared bucket refuses in short bursts: a single anonymous request
+        // that is refused right after a pool sweep often answers 200 a moment
+        // later (measured: 3 of 4 simultaneous requests succeeded while the
+        // sequential ones were refused). One short retry, then the verdict.
+        if (auth === "Bearer public" && phase === 0 && !anonRetried && !(egressState.unhealthyUntil[egressState.active] > Date.now())) {
+          anonRetried = true
+          await new Promise((r) => setTimeout(r, 700))
+          attempt = -1
+          continue
+        }
         // A key's 429 is that key's own quota: it stops the sweep but says
         // nothing about the exit. The anonymous tier is the exit probe - if it
         // is refused, the path is refused, and the request gets one try on the

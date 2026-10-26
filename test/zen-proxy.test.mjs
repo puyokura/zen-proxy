@@ -1906,9 +1906,10 @@ describe("handleChat", () => {
     assert.equal(res.state.status, 429)
     assert.match(res.body, /FreeUsageLimitError/)
     // The refusal is a verdict on the account and the exit, not on the model:
-    // the first key's 429 jumps to the anonymous tier (the exit probe), then one
-    // retry on the other path. Three calls, not forty.
-    assert.equal(calls.length, 3, `upstream calls: ${calls.length}`)
+    // the first key's 429 jumps to the anonymous tier (the exit probe), one
+    // short retry for the shared bucket's burstiness, then one try on the other
+    // path. Four calls, not forty.
+    assert.equal(calls.length, 4, `upstream calls: ${calls.length}`)
     assert.deepEqual([...new Set(calls)], ["space-bunny-free"], "the catalog is not walked")
     assert.equal(res.state.headers["retry-after"], "30", "the upstream retry-after is passed through")
     assert.equal(zp.egressStatus().active, "direct", "both paths refused, so it does not stay on the failed one")
@@ -1947,7 +1948,7 @@ describe("handleChat", () => {
     await zp.handleMessages(req, res)
     assert.equal(res.state.status, 429)
     assert.match(res.body, /rate_limit_error/)
-    assert.equal(calls.length, 3)
+    assert.equal(calls.length, 4)
     assert.deepEqual([...new Set(calls)], ["space-bunny-free"], "the catalog is not walked")
   })
 
