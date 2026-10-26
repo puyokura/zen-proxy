@@ -350,8 +350,10 @@ const DEFAULT_CONFIG = {
     // auto: choose per request and switch when one path is refused.
     // always: pin the hop. off: never use the hop.
     mode: String(ENV.WARP_PROXY_MODE ?? "auto").trim().toLowerCase(),
-    // How long a refused path is avoided before it may be tried again.
-    cooldownMs: Number(ENV.WARP_PROXY_COOLDOWN_MS ?? 300000),
+    // How long a refused path is avoided before it may be tried again. The
+    // bucket refills in tens of seconds, so a long avoidance only pins the
+    // install to the other (possibly worse) exit.
+    cooldownMs: Number(ENV.WARP_PROXY_COOLDOWN_MS ?? 60000),
   },
   // A quota/gate refusal is a verdict on the account and the exit, never on the
   // model: report it after one account sweep (and at most one path switch)
@@ -1310,7 +1312,7 @@ function projectHash() {
 // answered for `warpProxy.cooldownMs`. Node's fetch has no per-request proxy
 // option, so the adaptive path is Bun-only (the free tier is Bun-only too); under
 // Node an env proxy still applies globally.
-const egressState = { active: "direct", unhealthyUntil: { direct: 0, warp: 0 }, switchedAt: 0, reason: "" }
+const egressState = { active: "direct", unhealthyUntil: { direct: 0, warp: 0 }, switchedAt: 0, reason: "", bothRefusedUntil: 0 }
 
 function egressMode() {
   const m = String(config.warpProxy?.mode ?? "auto").toLowerCase()
@@ -1335,6 +1337,7 @@ function initEgress() {
   egressState.active = egressMode() === "always" && warpUsable() ? "warp" : "direct"
   egressState.switchedAt = Date.now()
   egressState.reason = egressMode() === "off" ? "hop disabled" : `start on ${egressState.active}`
+  egressState.bothRefusedUntil = 0
 }
 function egressFetch(url, init) {
   const proxy = egressState.active === "warp" ? relayProxyUrl() : null
@@ -1371,6 +1374,9 @@ function switchEgress(why) {
 }
 function canSwitchEgress(now = Date.now()) {
   if (egressMode() !== "auto") return false
+  // When both paths refused within one request, switching again right away only
+  // ping-pongs. Hold the choice for a short while and just report the verdict.
+  if (now < egressState.bothRefusedUntil) return false
   const to = otherEgress(egressState.active)
   return egressUsable(to) && egressState.unhealthyUntil[to] <= now
 }
@@ -1525,8 +1531,14 @@ function noteKeyUsed(auth, status) {
   // Keep the account out of the next few rotations: a spent key must not spend
   // the shared bucket ahead of a working credential.
   const raw = String(auth ?? "").replace(/^Bearer\s+/, "")
-  if (status === 429) blockKey(raw, 120_000)
-  else if (status === 401) blockKey(raw, 600_000)
+  if (status === 429) {
+    // The free bucket is shared by the accounts on an exit: measured, all four
+    // keys answered 429 in the same minute while the anonymous tier still
+    // answered 200. Blocking only the key that happened to speak first would
+    // make the next request burn the next key, four requests in a row.
+    if (raw === "public") blockKey(raw, 120_000)
+    else for (const k of poolKeys()) blockKey(k, 120_000)
+  } else if (status === 401) blockKey(raw, 600_000)
   else if (status >= 200 && status < 300) clearKeyBlock(raw)
 }
 
@@ -1884,10 +1896,12 @@ async function handleMessages(req, res) {
         }
         if (phase === 1 && egressReturnPath) {
           // Neither path answered: staying on the one that just failed would
-          // keep the install down for the whole cooldown.
+          // keep the install down for the whole cooldown, and switching on the
+          // next request would only ping-pong.
           egressState.unhealthyUntil[egressState.active] = Date.now() + 30_000
           egressState.active = egressReturnPath
           egressState.reason = `both paths refused; back to ${egressReturnPath}`
+          egressState.bothRefusedUntil = Date.now() + 60_000
           if (res.setHeader) res.setHeader("x-zen-egress", egressState.active)
         }
         fatalGate = true
@@ -2225,10 +2239,12 @@ async function handleChat(req, res, responsesRoute = false) {
         }
         if (phase === 1 && egressReturnPath) {
           // Neither path answered: staying on the one that just failed would
-          // keep the install down for the whole cooldown.
+          // keep the install down for the whole cooldown, and switching on the
+          // next request would only ping-pong.
           egressState.unhealthyUntil[egressState.active] = Date.now() + 30_000
           egressState.active = egressReturnPath
           egressState.reason = `both paths refused; back to ${egressReturnPath}`
+          egressState.bothRefusedUntil = Date.now() + 60_000
           if (res.setHeader) res.setHeader("x-zen-egress", egressState.active)
         }
         fatalGate = true
