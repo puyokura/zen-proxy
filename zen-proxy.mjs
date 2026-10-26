@@ -1800,8 +1800,10 @@ async function handleMessages(req, res) {
         }
       }
       // A rejected account is swapped before the model is abandoned (same rule as
-      // the chat path), and the chain bounds how often that can happen.
-      if (keyRotationWorthy(upstreamRes.status, null) && ai + 1 < auths.length) {
+      // the chat path), and the chain bounds how often that can happen. The
+      // anonymous tier is exempt: its 429 is the exit verdict, and rotating from
+      // it would only step into keys we already parked.
+      if (auth !== "Bearer public" && keyRotationWorthy(upstreamRes.status, null) && ai + 1 < auths.length) {
         log(`${keyLabel(auth)} rejected (${upstreamRes.status}) — retrying ${model} on the next account`)
         auth = auths[++ai]
         attempt--
@@ -2110,8 +2112,9 @@ async function handleChat(req, res, responsesRoute = false) {
       }
       // A rejected account is swapped before the model is abandoned: the model is
       // fine, this credential is not. Each swap advances the chain, so the loop
-      // is bounded by the number of accounts.
-      if (keyRotationWorthy(upstreamRes.status, null) && ai + 1 < auths.length) {
+      // is bounded by the number of accounts. The anonymous tier is exempt: its
+      // 429 is the exit verdict, not another account to try.
+      if (auth !== "Bearer public" && keyRotationWorthy(upstreamRes.status, null) && ai + 1 < auths.length) {
         log(`${keyLabel(auth)} rejected (${upstreamRes.status}) — retrying ${model} on the next account`)
         auth = auths[++ai]
         attempt--
