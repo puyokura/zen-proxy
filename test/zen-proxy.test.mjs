@@ -769,6 +769,26 @@ describe("free window (the daily allowance)", () => {
     assert.ok(models.length <= 2, `fallback hops: ${models.length}`)
   })
 
+  test("an expired window resumes upstream calls on the next request", async () => {
+    zp.noteQuotaWindow(600, "test")
+    zp.quotaState.until = Date.now() - 1000
+    let calls = 0
+    globalThis.fetch = routeFetch([
+      [
+        "/chat/completions",
+        () => {
+          calls++
+          return jsonResponse({ model: "m", choices: [{ message: { role: "assistant", content: "ok" } }] })
+        },
+      ],
+    ])
+    const res = mockRes()
+    await zp.handleChat(mockReq({ _body: JSON.stringify({ model: "a-free", messages: [] }) }), res)
+    assert.equal(res.state.status, 200)
+    assert.equal(calls, 1, "the first request after the reset is the probe")
+    assert.equal(zp.quotaStatus().windowUntil, null, "the window is cleared")
+  })
+
   test("sync does not probe a closed window", async () => {
     zp.noteQuotaWindow(600, "test")
     let calls = 0
