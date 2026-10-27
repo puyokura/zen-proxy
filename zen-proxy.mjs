@@ -3122,6 +3122,11 @@ async function probeModel(id, auth, session) {
   // status. Hang up instead of waiting for the model to finish its "ping".
   if (r.ok) {
     try { await r.body?.cancel() } catch {}
+  } else if (r.status === 429) {
+    // The probe is often the first call after a restart: learning the window here
+    // means the first client request is answered locally instead of spending its
+    // own call to discover the same thing.
+    noteQuotaWindow(parseRetryAfter(r.headers.get("retry-after")), `probe/${keyLabel(auth)}`)
   }
   return r
 }
