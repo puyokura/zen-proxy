@@ -19,7 +19,7 @@ anonymous free tier  ◦  no accounts  ◦  no keys  ◦  openai + anthropic com
 **What it enables:**
 
 - **Free models outside opencode, over either API** — OpenAI-compatible agents *and* Claude Code, keep the free tier
-- **Anonymous access with no accounts or keys** (`Bearer public`), or bring your own Zen key (BYOK) for your own quota
+- **Anonymous access with no accounts or keys** (`Bearer public`), or bring your own **paid or Go-entitled** Zen key — a free-tier key does not add quota, the pool is gateway-wide
 - **Smart model fallback** — when one free model is saturated, it rolls to the next
 - **Model aliases** — call them `gpt-4o` or `claude-3-5`, get routed to free models
 - **Self-updating** — tracks new opencode releases (auto User-Agent) and a GitHub Action keeps the shipped free-model list current as models come and go
@@ -200,7 +200,7 @@ Env vars: `HOST`, `PORT`, `ZEN_URL`, `ZEN_UA`, `INJECT_SESSION` (`0` to disable)
 
 ### bring your own key
 
-Anonymous `public` access rides opencode's shared free pool (per-IP quota, sometimes saturated). For stable, reliable use set `defaultZenKey` to your own free Zen key — or send it per request as `x-zen-key` / a non-`public` bearer token. With more than one account (`zenKeys`, or the `refs` named in `zenKeysRefs` of `zenKeysFile`) requests start on the next account in turn, `401`/`429` hands the request to the following account, and the anonymous tier remains the last resort; `/api/status` reports the pool and each account's request count, masked.
+Anonymous `public` access rides opencode's **gateway-wide free pool**, and so does every key, account and exit: measured, no `Authorization` at all, keys from four different accounts, a random project hash, every free model and the WARP exit all returned the same `retry-after` (resetting at 00:00 UTC). While that window is closed the proxy spends **zero upstream calls**, answers `429` locally with the reset header, and adds nothing to it; a `429` with `retry-after` therefore does not trigger account rotation or a path switch. For stable, reliable use, a paid or Go-entitled credential is required. `/api/status` reports the window under `quota` (`scope: "gateway"`).
 
 ---
 
@@ -210,7 +210,7 @@ The free tier is tied to the exit address, and a shared exit is refused outright
 
 The hop is reached through `scripts/warp-relay.mjs`, a small local relay: it opens each tunnel over the hop and falls back to a direct socket when the hop is unreachable. Node's own env proxy has no failover, so pointing `HTTPS_PROXY` straight at WARP would take every upstream call down whenever `warp-svc` stops.
 
-**The hop is a second exit, chosen per request — never a process-wide proxy.** Measured on the deployed host inside one minute: the WARP exit answered `429 FreeUsageLimitError` to every request while the host's own address answered 200 for twelve in a row, and a four-way parallel burst. Which exit works flips over hours, so a fixed `HTTPS_PROXY` is the failure mode itself. With `warpProxy.mode: "auto"` the proxy starts direct, retries a quota-refused request once on the other path, keeps whichever answered for `cooldownMs`, and avoids the refused one. `always` pins the hop; `off` never uses it.
+**The hop is a second exit, chosen per request — never a process-wide proxy.** Measured on the deployed host inside one minute: the WARP exit answered `429 FreeUsageLimitError` to every request while the host's own address answered 200 for twelve in a row, and a four-way parallel burst. Which exit works flips over hours, so a fixed `HTTPS_PROXY` is the failure mode itself. With `warpProxy.mode: "auto"` the proxy starts direct and switches only on **exit-specific** failures (403 `FreeTierError`, connection failure) — never on a `retry-after` window, which is gateway-wide and identical through both exits. `always` pins the hop; `off` never uses it.
 
 ```bash
 sudo bash deploy/install-warp.sh     # WARP + relay unit + zen-proxy drop-in
@@ -230,7 +230,7 @@ Do not put `HTTPS_PROXY` / `NODE_USE_ENV_PROXY` in the unit: an env proxy pins e
 
 `fallback: "direct"` means the relay uses a direct socket when the hop is down; `"none"` refuses instead. `GET /api/status` reports the hop under `warp` (tunnel counters, how many went over the hop, how many fell back) and the choice under `egress` (`active`, per-path health, why), and the relay answers the same counters on `http://127.0.0.1:8890/__status`.
 
-The upstream then sees the WARP exit address instead of yours, and WARP hands out a different exit address per connection — a quota tied to one address is not guaranteed to follow.
+The upstream then sees the WARP exit address instead of yours, and WARP hands out a different exit address per connection — but the free window is gateway-wide, so a different exit does not buy quota (measured: identical `retry-after` through both).
 
 ---
 
@@ -306,7 +306,7 @@ plus response headers `x-zen-served-by` and `x-zen-fallback: true`.
 
 ## caveats
 
-- This rides opencode's **anonymous free tier**: per-IP request/daily quotas and a shared pool that's sometimes saturated. Don't rotate/abuse IPs or run heavy workloads anonymously.
+- This rides opencode's **anonymous free tier**, which is a gateway-wide shared pool with a small daily allowance (it resets at 00:00 UTC). It is not per account, key or exit, so extra credentials do not add quota. Don't rotate/abuse IPs or run heavy workloads anonymously.
 - opencode keeps **tightening the anonymous free tier** — most `-free` models now answer `403 FreeTierError: "OpenCode's free tier can only be used from within OpenCode"`, and that hits the real opencode client too. The proxy detects it and rolls to the next working model, so requests keep succeeding, but the pool is much smaller than it used to be. A Zen API key (BYOK) is the reliable path.
 - The `-free` models are "as-is" free tiers — expect rate limits and occasional provider errors.
 - For anything serious, **BYOK**.

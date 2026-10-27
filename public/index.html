@@ -840,11 +840,10 @@ async function populateConfigForm() {
     const q = st.quota || {}
     $("cfgQuota").textContent = q.windowUntil
       ? "free window: closed until " + new Date(q.windowUntil).toLocaleString() +
-        " (" + Math.ceil((q.remainingSec || 0) / 60) + " min)" +
+        " (" + Math.ceil((q.remainingSec || 0) / 60) + " min, gateway-wide)" +
         " · today " + (q.todaySuccess || 0) + " ok / " + (q.todayRefused || 0) + " refused"
       : "free window: open" +
-        " · today " + (q.todaySuccess || 0) + " ok / " + (q.todayRefused || 0) + " refused" +
-        (q.keysShareWindow ? " · configured keys share one window" : "")
+        " · today " + (q.todaySuccess || 0) + " ok / " + (q.todayRefused || 0) + " refused"
   } catch {}
 }
 

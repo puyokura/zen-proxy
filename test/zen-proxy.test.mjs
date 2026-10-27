@@ -789,6 +789,17 @@ describe("free window (the daily allowance)", () => {
     assert.equal(zp.quotaStatus().windowUntil, null, "the window is cleared")
   })
 
+  test("the status names the window's scope", () => {
+    zp.clearQuotaWindow()
+    assert.equal(zp.quotaStatus().scope, "gateway")
+    assert.equal(zp.quotaStatus().windowUntil, null)
+    zp.noteQuotaWindow(600, "test")
+    const q = zp.quotaStatus()
+    assert.equal(q.scope, "gateway")
+    assert.ok(q.windowUntil)
+    assert.ok(!("keysShareWindow" in q), "the window is not a property of the key pool")
+  })
+
   test("sync does not probe a closed window", async () => {
     zp.noteQuotaWindow(600, "test")
     let calls = 0

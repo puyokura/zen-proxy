@@ -1465,8 +1465,11 @@ function quotaStatus() {
     source: quotaState.source,
     todaySuccess: quotaDays.day === utcDay() ? quotaDays.success : 0,
     todayRefused: quotaDays.day === utcDay() ? quotaDays.refused : 0,
-    // Every key in one workspace shares one window, so a pool is not extra quota.
-    keysShareWindow: poolKeys().length > 1,
+    // Measured: the window is the same with no auth at all, with a random
+    // project hash, on every free model, and through both exits. It is the
+    // gateway's shared free pool, not this install's account or address, so a
+    // pool of keys (even from different accounts) adds nothing.
+    scope: "gateway",
   }
 }
 // Answered from local state: no auth plan, no rotation, no upstream call.
@@ -1485,7 +1488,7 @@ function sendQuotaWindow(res, anthropic = false) {
         type: "error",
         error: {
           type: "FreeUsageLimitError",
-          message: `free window closed until ${until} (${Math.ceil(retryAfter / 60)} min left); every credential and exit shares it`,
+          message: `free window closed until ${until} (${Math.ceil(retryAfter / 60)} min left); the gateway's shared free pool, not this account or exit`,
         },
       }
   res.writeHead(429, headers)
