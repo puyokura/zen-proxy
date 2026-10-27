@@ -168,6 +168,7 @@ beforeEach(() => {
   // from a clean slate or the previous case decides this one's call count.
   zp.keyBlocks.clear()
   Object.assign(zp.egressState.unhealthyUntil, { direct: 0, warp: 0 })
+  zp.clearQuotaWindow()
   zp.initEgress()
   Object.assign(zp.requestStats, { total: 0, errors: 0, recent: [], perMinute: new Map(), window60: [] })
   Object.assign(zp.syncState, { at: 0, ok: false, running: false, ms: 0, working: [], rateLimited: [], flaky: [], gated: [], systemone: [], dead: [], error: "", streak: 0 })
@@ -659,6 +660,125 @@ describe("egress selection (direct vs the WARP hop)", () => {
     ])
     await zp.syncModels()
     assert.equal(probes, 1)
+  })
+})
+
+describe("free window (the daily allowance)", () => {
+  const quotaConfig = () => ({
+    autoSyncIntervalMs: 0,
+    cacheMs: 0,
+    syncIdleMs: 0,
+    syncProbeModels: 0,
+    retriesPerModel: 2,
+    defaultModel: "",
+    fallbackModels: ["a-free", "b-free", "c-free"],
+    warpProxy: { enabled: true, hop: "http://127.0.0.1:40000", mode: "auto", port: 8890, fallback: "direct" },
+  })
+
+  test("a stated reset time closes the window after a single call", async () => {
+    zp.saveConfig(quotaConfig())
+    zp.initEgress()
+    let calls = 0
+    globalThis.fetch = routeFetch([
+      [
+        "/chat/completions",
+        () => {
+          calls++
+          return jsonResponse({ type: "error", error: { type: "FreeUsageLimitError", message: "Free usage limit reached." } }, 429, { "retry-after": "600" })
+        },
+      ],
+    ])
+    const res = mockRes()
+    await zp.handleChat(mockReq({ _body: JSON.stringify({ model: "a-free", messages: [] }) }), res)
+    assert.equal(res.state.status, 429)
+    assert.equal(calls, 1, "the window is credential-wide, so one call decides it")
+    const q = zp.quotaStatus()
+    assert.ok(q.remainingSec > 500 && q.remainingSec <= 600, `remaining ${q.remainingSec}`)
+    assert.ok(q.windowUntil, "the reset instant is recorded")
+  })
+
+  test("while the window is closed nothing reaches upstream", async () => {
+    zp.noteQuotaWindow(600, "test")
+    let calls = 0
+    globalThis.fetch = async () => {
+      calls++
+      return jsonResponse({}, 500)
+    }
+    const started = Date.now()
+    const res = mockRes()
+    await zp.handleChat(mockReq({ _body: JSON.stringify({ model: "a-free", messages: [] }) }), res)
+    assert.equal(res.state.status, 429)
+    assert.equal(calls, 0, "zero upstream calls")
+    assert.match(res.state.headers["retry-after"], /^\d+$/)
+    assert.ok(res.state.headers["x-zen-quota-window"], "the reset instant is exposed")
+    assert.ok(Date.now() - started < 200, "answered locally")
+  })
+
+  test("the Anthropic route is answered locally too", async () => {
+    zp.noteQuotaWindow(600, "test")
+    let calls = 0
+    globalThis.fetch = async () => {
+      calls++
+      return jsonResponse({}, 500)
+    }
+    const res = mockRes()
+    await zp.handleMessages(
+      mockReq({ _body: JSON.stringify({ model: "a-free", max_tokens: 8, messages: [{ role: "user", content: "hi" }] }) }),
+      res,
+    )
+    assert.equal(res.state.status, 429)
+    assert.equal(calls, 0)
+    assert.match(res.body, /rate_limit_error/)
+  })
+
+  test("a burst refusal without a reset time stays a retry, not a window", async () => {
+    zp.saveConfig({ ...quotaConfig(), warpProxy: { enabled: true, hop: "http://127.0.0.1:40000", mode: "off", port: 8890, fallback: "direct" } })
+    zp.initEgress()
+    let calls = 0
+    globalThis.fetch = routeFetch([
+      [
+        "/chat/completions",
+        () => {
+          calls++
+          return jsonResponse({ error: { type: "FreeUsageLimitError", message: "Free usage limit reached." } }, 429)
+        },
+      ],
+    ])
+    const res = mockRes()
+    await zp.handleChat(mockReq({ _body: JSON.stringify({ model: "a-free", messages: [] }) }), res)
+    assert.equal(res.state.status, 429)
+    assert.ok(calls <= 4, `bounded: ${calls}`)
+    assert.equal(zp.quotaStatus().windowUntil, null)
+  })
+
+  test("the model chain is capped at one fallback", async () => {
+    zp.saveConfig({ ...quotaConfig(), retriesPerModel: 0 })
+    zp.initEgress()
+    const models = []
+    globalThis.fetch = routeFetch([
+      [
+        "/chat/completions",
+        (u, opts) => {
+          models.push(JSON.parse(opts.body).model)
+          return jsonResponse({ error: { type: "ModelError", message: "Model a-free is not supported" } }, 400)
+        },
+      ],
+    ])
+    const res = mockRes()
+    await zp.handleChat(mockReq({ _body: JSON.stringify({ model: "a-free", messages: [] }) }), res)
+    assert.ok(models.length <= 2, `fallback hops: ${models.length}`)
+  })
+
+  test("sync does not probe a closed window", async () => {
+    zp.noteQuotaWindow(600, "test")
+    let calls = 0
+    globalThis.fetch = async () => {
+      calls++
+      return jsonResponse({}, 500)
+    }
+    const r = await zp.syncModels()
+    assert.equal(r.skipped, "quota")
+    assert.equal(calls, 0)
   })
 })
 

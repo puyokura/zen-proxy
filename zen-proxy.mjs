@@ -1385,6 +1385,7 @@ function canSwitchEgress(now = Date.now()) {
 function noteEgressSuccess() {
   egressState.unhealthyUntil[egressState.active] = 0
   egressState.bothRefusedUntil = 0
+  quotaCount("success")
 }
 function egressStatus() {
   const now = Date.now()
@@ -1409,6 +1410,87 @@ function egressStatus() {
 // The configured start path is applied once the egress helpers exist (the
 // config is loaded above, but `egressState` is a const declared in this block).
 initEgress()
+
+// ---- the free window --------------------------------------------------------
+// The free allowance is per account/workspace, not per exit and not per key:
+// measured, every credential (four keys in one workspace) and both exits (the
+// host's address and the WARP exit) returned the SAME `retry-after`. Rotating a
+// key or a path therefore cannot buy quota, and every request spent while the
+// window is closed is wasted (the night before: 141 refused calls for 19 that
+// worked). Once the gateway says when it refills, spend nothing until then.
+const QUOTA_WINDOW_MIN_SEC = 60
+const quotaState = { until: 0, retryAfter: 0, at: 0, source: "" }
+let quotaDays = { day: "", success: 0, refused: 0 }
+const utcDay = (at = Date.now()) => new Date(at).toISOString().slice(0, 10)
+function quotaCount(kind) {
+  const day = utcDay()
+  if (quotaDays.day !== day) quotaDays = { day, success: 0, refused: 0 }
+  if (kind === "success") quotaDays.success++
+  else quotaDays.refused++
+}
+function quotaRemainingSec(now = Date.now()) {
+  return quotaState.until ? Math.max(0, Math.ceil((quotaState.until - now) / 1000)) : 0
+}
+// Returns true when this refusal is a hard window (and records it).
+function noteQuotaWindow(retryAfterSec, source) {
+  const secs = Number(retryAfterSec)
+  if (!Number.isFinite(secs) || secs < QUOTA_WINDOW_MIN_SEC) return false
+  const until = Date.now() + secs * 1000
+  if (until > quotaState.until) {
+    quotaState.until = until
+    quotaState.retryAfter = Math.ceil(secs)
+    quotaState.at = Date.now()
+    quotaState.source = String(source ?? "")
+    log(`free window closed until ${new Date(until).toISOString()} (${Math.round(secs / 60)} min, ${quotaState.source})`)
+  }
+  return true
+}
+function quotaBlocked() {
+  if (!quotaState.until) return false
+  if (quotaRemainingSec() > 0) return true
+  quotaState.until = 0
+  quotaState.retryAfter = 0
+  log("free window reset - upstream calls resume")
+  return false
+}
+function clearQuotaWindow() {
+  quotaState.until = 0
+  quotaState.retryAfter = 0
+  quotaState.source = ""
+}
+function quotaStatus() {
+  return {
+    windowUntil: quotaState.until ? new Date(quotaState.until).toISOString() : null,
+    remainingSec: quotaRemainingSec(),
+    source: quotaState.source,
+    todaySuccess: quotaDays.day === utcDay() ? quotaDays.success : 0,
+    todayRefused: quotaDays.day === utcDay() ? quotaDays.refused : 0,
+    // Every key in one workspace shares one window, so a pool is not extra quota.
+    keysShareWindow: poolKeys().length > 1,
+  }
+}
+// Answered from local state: no auth plan, no rotation, no upstream call.
+function sendQuotaWindow(res, anthropic = false) {
+  const retryAfter = quotaRemainingSec()
+  const until = quotaState.until ? new Date(quotaState.until).toISOString() : ""
+  const headers = {
+    "content-type": "application/json",
+    "retry-after": String(retryAfter),
+    "x-zen-egress": egressState.active,
+    ...(until ? { "x-zen-quota-window": until } : {}),
+  }
+  const body = anthropic
+    ? { type: "error", error: { type: "rate_limit_error", message: `free window closed until ${until} (${Math.ceil(retryAfter / 60)} min left)` } }
+    : {
+        type: "error",
+        error: {
+          type: "FreeUsageLimitError",
+          message: `free window closed until ${until} (${Math.ceil(retryAfter / 60)} min left); every credential and exit shares it`,
+        },
+      }
+  res.writeHead(429, headers)
+  res.end(JSON.stringify(body))
+}
 
 function zenHeaders(req, auth) {
   const headers = {
@@ -1720,6 +1802,12 @@ async function handleMessages(req, res) {
   let auth = auths[0]
   let ai = 0
 
+  // Closed free window: answered locally, no upstream call (see quotaState).
+  if (quotaBlocked()) {
+    quotaCount("refused")
+    recordReq(req, requested, Date.now() - start, 429)
+    return sendQuotaWindow(res, true)
+  }
   let lastErr = null
   let lastStatus = 502
   let firstErr = null
@@ -1747,7 +1835,12 @@ async function handleMessages(req, res) {
   // The relay layers keep the pinned call and drop the rest.
   const keepable = bridged ? null : keepableFor(body?.tools, true)
   const pin = bridged ? null : pinnedToolName(body.tool_choice)
+  // One fallback, not a catalog walk: each extra model costs an upstream call
+  // from the same daily allowance, and a model-level failure is the only reason
+  // to spend one (quota refusals break out before this point).
+  let modelHops = 0
   for (const model of candidates) {
+    if (modelHops++ >= 2) break
     const chosen = model === candidates[0]
     used = model
     const format = modelFormat(model)
@@ -1877,6 +1970,16 @@ async function handleMessages(req, res) {
       const gateKind = config.freeTierFastFail ? gateRefusalKind(lastStatus, lastErr) : ""
       if (gateKind === "quota") {
         lastRetryAfter = Math.max(lastRetryAfter, parseRetryAfter(upstreamRes.headers.get("retry-after")))
+        // A stated reset time is a hard window. Measured: every credential (four
+        // keys in one workspace) and both exits returned the same retry-after, so
+        // rotating a key or a path only spends another call. Record it and answer
+        // from local state until it refills.
+        const windowSec = parseRetryAfter(upstreamRes.headers.get("retry-after"))
+        if (noteQuotaWindow(windowSec, `${egressState.active}/${keyLabel(auth)}`)) {
+          quotaCount("refused")
+          fatalGate = true
+          break
+        }
         // The shared bucket refuses in short bursts: a single anonymous request
         // that is refused right after a pool sweep often answers 200 a moment
         // later (measured: 3 of 4 simultaneous requests succeeded while the
@@ -2004,6 +2107,13 @@ async function handleChat(req, res, responsesRoute = false) {
   const auths = plan.auths.length ? plan.auths : ["Bearer public"]
   let auth = auths[0]
   let ai = 0
+  // A closed free window is answered locally: zero upstream calls, the reset
+  // time the gateway gave us, and no rotation (all credentials share it).
+  if (quotaBlocked()) {
+    quotaCount("refused")
+    recordReq(req, requested, Date.now() - start, 429)
+    return sendQuotaWindow(res, false)
+  }
   let lastErr = null
   let lastStatus = 502
   let firstErr = null
@@ -2044,7 +2154,12 @@ async function handleChat(req, res, responsesRoute = false) {
   // equivalent for — the relay layers drop those.
   const bridged = bridge.length > 0 && !callerTools.length
   const keepable = bridged ? null : keepableFor(callerTools, false)
+  // One fallback, not a catalog walk: each extra model costs an upstream call
+  // from the same daily allowance, and a model-level failure is the only reason
+  // to spend one (quota refusals break out before this point).
+  let modelHops = 0
   for (const model of candidates) {
+    if (modelHops++ >= 2) break
     const chosen = model === candidates[0]
     used = model
     const format = modelFormat(model)
@@ -2223,6 +2338,16 @@ async function handleChat(req, res, responsesRoute = false) {
       const gateKind = config.freeTierFastFail ? gateRefusalKind(lastStatus, lastErr) : ""
       if (gateKind === "quota") {
         lastRetryAfter = Math.max(lastRetryAfter, parseRetryAfter(upstreamRes.headers.get("retry-after")))
+        // A stated reset time is a hard window. Measured: every credential (four
+        // keys in one workspace) and both exits returned the same retry-after, so
+        // rotating a key or a path only spends another call. Record it and answer
+        // from local state until it refills.
+        const windowSec = parseRetryAfter(upstreamRes.headers.get("retry-after"))
+        if (noteQuotaWindow(windowSec, `${egressState.active}/${keyLabel(auth)}`)) {
+          quotaCount("refused")
+          fatalGate = true
+          break
+        }
         // The shared bucket refuses in short bursts: a single anonymous request
         // that is refused right after a pool sweep often answers 200 a moment
         // later (measured: 3 of 4 simultaneous requests succeeded while the
@@ -3503,6 +3628,12 @@ async function fetchModels() {
 
 async function syncModels() {
   if (syncState.running) return syncState
+  // A closed window has a known reset time: probing now spends an allowance we
+  // already know is zero (measured: an hourly probe was refused all night).
+  if (quotaBlocked()) {
+    log("auto-sync skipped: free window closed")
+    return { ...syncState, skipped: "quota" }
+  }
   // Real traffic first: a probe is worth nothing if it costs the user a turn.
   // The gate's bucket is shared, and the old every-model sweep both spent it and
   // reported the resulting 429s as "all models rate-limited".
@@ -3917,6 +4048,7 @@ async function handleStatus(req, res) {
     uptime: Math.floor(process.uptime()),
     runtime: runtimeInfo(),
     egress: egressStatus(),
+    quota: quotaStatus(),
     upstreamOk: cache.ok,
     upstream: config.upstream,
     ua: config.ua,
@@ -4090,6 +4222,11 @@ async function handleSystemone(req, res) {
   }
   const auths = plan.auths.length ? plan.auths : ["Bearer public"]
 
+  if (quotaBlocked()) {
+    quotaCount("refused")
+    recordReq(req, `${model || "systemone"} (systemone)`, Date.now() - start, 429)
+    return sendQuotaWindow(res, false)
+  }
   let lastErr = null
   let lastStatus = 502
   let switched = false
@@ -4431,6 +4568,15 @@ export {
   noteEgressSuccess,
   initEgress,
   keyBlocks,
+  // free window
+  quotaState,
+  quotaDays,
+  quotaStatus,
+  quotaBlocked,
+  quotaCount,
+  noteQuotaWindow,
+  clearQuotaWindow,
+  sendQuotaWindow,
   parseList,
   clientIp,
   ipOmit,

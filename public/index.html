@@ -433,6 +433,9 @@ textarea { resize:vertical; min-height:96px; font-family:var(--mono); font-size:
           <div class="row" style="gap:8px;margin-top:2px">
             <span class="hint mono" id="cfgEgress"></span>
           </div>
+          <div class="row" style="gap:8px;margin-top:2px">
+            <span class="hint mono" id="cfgQuota"></span>
+          </div>
           <label>Timeout (ms)</label><input id="cfgTimeout" type="number">
         </div>
       </div>
@@ -834,6 +837,14 @@ async function populateConfigForm() {
         " · warp " + (!eg.healthy?.warp && eg.avoidForSec?.warp ? "avoided " + eg.avoidForSec.warp + "s" : eg.healthy?.warp ? "ok" : "off") +
         (eg.reason ? " · " + eg.reason : "")
       : "egress: unknown"
+    const q = st.quota || {}
+    $("cfgQuota").textContent = q.windowUntil
+      ? "free window: closed until " + new Date(q.windowUntil).toLocaleString() +
+        " (" + Math.ceil((q.remainingSec || 0) / 60) + " min)" +
+        " · today " + (q.todaySuccess || 0) + " ok / " + (q.todayRefused || 0) + " refused"
+      : "free window: open" +
+        " · today " + (q.todaySuccess || 0) + " ok / " + (q.todayRefused || 0) + " refused" +
+        (q.keysShareWindow ? " · configured keys share one window" : "")
   } catch {}
 }
 
