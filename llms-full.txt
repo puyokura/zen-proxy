@@ -200,7 +200,7 @@ Env vars: `HOST`, `PORT`, `ZEN_URL`, `ZEN_UA`, `INJECT_SESSION` (`0` to disable)
 
 ### bring your own key
 
-Anonymous `public` access rides opencode's **gateway-wide free pool**, and so does every key, account and exit: measured, no `Authorization` at all, keys from four different accounts, a random project hash, every free model and the WARP exit all returned the same `retry-after` (resetting at 00:00 UTC). While that window is closed the proxy spends **zero upstream calls**, answers `429` locally with the reset header, and adds nothing to it; a `429` with `retry-after` therefore does not trigger account rotation or a path switch. For stable, reliable use, a paid or Go-entitled credential is required. `/api/status` reports the window under `quota` (`scope: "gateway"`).
+Anonymous `public` access rides opencode's **gateway-wide free pool**, and so does every key, account and exit: measured, no `Authorization` at all, keys from four different accounts, a random project hash, every free model and the WARP exit all returned the same `retry-after`. The window is **rolling** — `retry-after` is the authoritative "when one passes again" (observed near 00:00 UTC on one day and 00:27 UTC the next), so do not assume a fixed reset. While it is closed the proxy spends **zero upstream calls**, answers `429` locally with that header, and adds nothing to it; a `429` with `retry-after` therefore does not trigger account rotation or a path switch. For stable, reliable use, a paid or Go-entitled credential is required. `/api/status` reports the window under `quota` (`scope: "gateway"`).
 
 ---
 

@@ -185,7 +185,9 @@ zen-proxy はそのゲートウェイの手前に立ち、エージェントの�
 | モデルを5種類に変更 | 同じ |
 | WARP 経由（別の出口IP） | 同じ |
 
-つまり枠は**アカウント・キー・ワークスペース・出口IP・モデルのどれでも変わりません**。キーやアカウントを増やしても無料枠は増えず、出口を変えても増えません。リセットは **00:00 UTC（09:00 JST）** です。（以前「出口IPの枠」「アカウント単位の枠」と書いたのは誤りでした。）
+つまり枠は**アカウント・キー・ワークスペース・出口IP・モデルのどれでも変わりません**。キーやアカウントを増やしても無料枠は増えず、出口を変えても増えません。
+
+窓は**ローリング**です。固定の時刻にリセットされるのではなく、`retry-after` が「次に1回通るようになるまで」を秒で示します（実測でも 00:00 UTC 前後だったり、翌 00:27 UTC だったりと動きました）。したがって**リセット時刻を推測せず、`retry-after` をそのまま信頼する**のが正解で、zen-proxy もそうしています。（以前「出口IPの枠」「アカウント単位の枠」と書いたのは誤りでした。）
 
 有料モデルは同じキーで `403 Model access is disabled` を返します（このアカウントでは有効化されていません）。
 
@@ -331,6 +333,32 @@ curl -s http://127.0.0.1:8787/api/status  # egress: いまどちらの経路か�
 | `zen-proxy.service.d/warp-proxy.conf` | `/etc/systemd/system` | ホップの場所（`WARP_PROXY_HOP`）と `WARP_PROXY_MODE=auto` を宣言するだけ |
 
 **`HTTPS_PROXY` をユニットに入れないでください。** プロセス全体の env プロキシは全リクエストを1つの出口に固定し、その出口が拒否された瞬間に全滅します（自動選択も効かなくなります）。起動時に env プロキシを見つけたら、zen-proxy は警告を出します。ホップのアドレスやポートを変えたときだけ再起動が必要で、`mode` の変更は次のリクエストから反映されます。
+
+### オン／オフの切り替え
+
+`warpProxy.mode` が唯一のスイッチです（`zen-proxy.json` の値が env より優先されます）。
+
+| 値 | 動き |
+|---|---|
+| `auto`（既定） | direct から始め、**出口固有**の失敗（403 `FreeTierError`、接続失敗）のときだけ WARP へ切り替え |
+| `always` | WARP 固定 |
+| `off` | WARP を使わない（direct のみ。起動ログは `egress: direct only (hop disabled)`） |
+
+```bash
+# direct 固定にする（WARP を止める）
+curl -s -X PUT http://127.0.0.1:8787/api/config \
+  -H 'content-type: application/json' -d '{"warpProxy":{"mode":"off"}}'
+sudo systemctl disable --now zen-proxy-warp-relay
+warp-cli --accept-tos disconnect
+
+# 元に戻す
+warp-cli --accept-tos connect
+sudo systemctl enable --now zen-proxy-warp-relay
+curl -s -X PUT http://127.0.0.1:8787/api/config \
+  -H 'content-type: application/json' -d '{"warpProxy":{"mode":"auto"}}'
+```
+
+ダッシュボードの「Upstream egress」からも同じ切り替えができます。`/api/status` の `egress` に `mode` / `active` / `healthy` が出ます。
 
 元に戻す:
 
